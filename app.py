@@ -19,13 +19,41 @@ app = Flask(__name__, static_folder='static', template_folder='templates')
 bgp_running = False
 bgp_local_config = {'local_as': 65000, 'router_id': '192.168.100.174'}
 bgp_neighbors = {}  # {ip: {asn, description, active, state, learned_v4, learned_v6, advertised_v4, advertised_v6, af_types}}
+BGP_STATE_FILE = '/opt/trex-web/bgp_state.json'
 
-# BGP is driven by BIRD 2.x (native TRex integration). BIRD peers with 171/172 over
-# the management network and is independent of the TRex/iPerf3 data-port mode.
-BIRD_BIN  = '/usr/sbin/bird'
-BIRDC     = '/usr/sbin/birdc'
-BIRD_CONF = '/etc/bird/bird.conf'
-BIRD_SOCK = '/run/bird/bird.ctl'
+def _save_bgp_state():
+    try:
+        with open(BGP_STATE_FILE, 'w') as f:
+            json.dump(bgp_neighbors, f, indent=2)
+    except Exception:
+        pass
+
+def _load_bgp_state():
+    global bgp_neighbors
+    try:
+        with open(BGP_STATE_FILE) as f:
+            bgp_neighbors = json.load(f)
+    except Exception:
+        pass
+
+
+# BIRD runs inside data-plane namespaces (source IP = namespace IP)
+BIRD_NS = {
+    'iperf_ns2': {'local_ip': '10.0.0.2', 'switch_ip': '10.0.0.3',
+                  'conf': '/tmp/bird/ns2.conf', 'sock': '/tmp/bird/ns2.ctl'},
+    'iperf_ns':  {'local_ip': '10.20.0.0', 'switch_ip': '10.20.0.1',
+                  'conf': '/tmp/bird/ns.conf',  'sock': '/tmp/bird/ns.ctl'},
+}
+BIRD_BIN = '/usr/sbin/bird'
+BIRDC    = '/usr/sbin/birdc'
+
+def _ns_for_neighbor(ip):
+    if '.' in ip:
+        if ip.startswith('10.0.0.'): return 'iperf_ns2'
+        if ip.startswith('10.20.0.'): return 'iperf_ns'
+    return None
+
+_load_bgp_state()
 
 # TRex hosts
 trex_hosts = {
@@ -564,119 +592,114 @@ def pps_to_bandwidth(pps, pkt_size=64):
     overhead = 20
     return round((pps * (pkt_size + overhead) * 8) / 1e6, 2)
 
-# ═══════════════════ BGP: BIRD Control ═══════════════════
-# BIRD 2.x replaces ExaBGP. The HTTP API contract is unchanged so the frontend
-# (index.html) needs no edits. Per-neighbor advertised prefixes are rendered as
-# per-neighbor `static` protocols and exported only to that peer.
+# ═══════════════════ BGP: BIRD Control (namespace-aware) ═══════════════════
+# BIRD 2.x runs INSIDE each data-plane namespace so source IP matches the
+# physical port IP.  The HTTP API contract is unchanged so index.html is fine.
 
-def _birdc(*args):
-    """Run a birdc command against the BIRD control socket. Returns (ok, output)."""
+BIRD_BIN = '/usr/sbin/bird'
+BIRDC    = '/usr/sbin/birdc'
+
+def _birdc_ns(ns, *args):
+    """Run birdc inside a namespace. Returns (ok, output)."""
+    cfg = BIRD_NS.get(ns)
+    if not cfg: return False, f'Unknown namespace: {ns}'
     try:
-        r = subprocess.run([BIRDC, '-s', BIRD_SOCK] + list(args),
-                           capture_output=True, text=True, timeout=8)
+        r = subprocess.run(
+            ['sudo', 'ip', 'netns', 'exec', ns, BIRDC, '-s', cfg['sock']] + list(args),
+            capture_output=True, text=True, timeout=8)
         return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
     except Exception as e:
         return False, str(e)
 
+def _birdc(peer_ip, *args):
+    """Run birdc in the namespace that owns this peer IP."""
+    ns = _ns_for_neighbor(peer_ip)
+    if not ns: return False, f'No namespace for {peer_ip}'
+    return _birdc_ns(ns, *args)
+
 def _proto_name(ip):
-    """Stable BIRD protocol name for a neighbor IP (BIRD allows [A-Za-z0-9_])."""
     return 'peer_' + re.sub(r'[^0-9a-zA-Z]', '_', ip)
 
 def _bird_state_to_status(bird_info):
     s = (bird_info or '').lower()
-    if 'establ' in s:
-        return 'established'
-    if any(k in s for k in ('active', 'connect', 'opensent', 'openconfirm')):
-        return 'connecting'
-    if 'idle' in s:
-        return 'idle'
+    if 'establ' in s: return 'established'
+    if any(k in s for k in ('active', 'connect', 'opensent', 'openconfirm')): return 'connecting'
+    if 'idle' in s: return 'idle'
     return s.strip() or 'unknown'
 
 def _get_local_ipv6():
-    """Find a global unicast IPv6 address on this host."""
     try:
         r = subprocess.run(['ip', '-6', 'addr', 'show', 'scope', 'global'],
                            capture_output=True, text=True, timeout=3)
         for line in r.stdout.splitlines():
             m = re.search(r'inet6\s+([0-9a-f:]+)/\d+', line)
-            if m and not m.group(1).startswith('fe80'):
-                return m.group(1)
-    except Exception:
-        pass
+            if m and not m.group(1).startswith('fe80'): return m.group(1)
+    except Exception: pass
     return '::1'
 
-# ── Config builder ──
+# ── Config builder (per-namespace) ──
 
-def _build_bird_config():
-    """Render bird.conf from bgp_local_config + bgp_neighbors. Returns active count."""
-    rid = bgp_local_config['router_id']
+def _build_bird_configs():
+    """Generate BIRD configs for all namespaces with active neighbors."""
     local_as = bgp_local_config['local_as']
-    local6 = None
-    lines = [
-        '# Auto-generated by trex-web. Do not edit by hand.',
-        'log syslog all;',
-        f'router id {rid};',
-        '',
-        'protocol device { }',
-        '',
-    ]
-    active = 0
-    for ip, nbr in bgp_neighbors.items():
-        if not nbr.get('active', True):
-            continue
-        active += 1
-        pname = _proto_name(ip)
-        is_v6 = ':' in ip
-        if is_v6 and local6 is None:
-            local6 = _get_local_ipv6()
-        local_addr = local6 if is_v6 else rid
+    active_total = 0
+    for ns, cfg in BIRD_NS.items():
+        lines = [
+            '# Auto-generated by trex-web.',
+            'log syslog all;',
+            f'router id {cfg["local_ip"]};',
+            '', 'protocol device { }', '',
+        ]
+        ns_active = 0
+        for ip, nbr in bgp_neighbors.items():
+            if _ns_for_neighbor(ip) != ns or not nbr.get('active', True):
+                continue
+            ns_active += 1
+            pname = _proto_name(ip)
+            is_v6 = ':' in ip
+            local_addr = _get_local_ipv6() if is_v6 else cfg['local_ip']
 
-        adv4 = nbr.get('advertised_v4', [])
-        adv6 = nbr.get('advertised_v6', [])
-        if adv4:
-            lines.append(f'protocol static static4_{pname} {{')
-            lines.append('    ipv4;')
-            for pfx in adv4:
-                lines.append(f'    route {pfx} blackhole;')
+            adv4 = nbr.get('advertised_v4', [])
+            adv6 = nbr.get('advertised_v6', [])
+            if adv4:
+                lines.append(f'protocol static static4_{pname} {{')
+                lines.append('    ipv4;')
+                for pfx in adv4: lines.append(f'    route {pfx} blackhole;')
+                lines.append('}')
+            if adv6:
+                lines.append(f'protocol static static6_{pname} {{')
+                lines.append('    ipv6;')
+                for pfx in adv6: lines.append(f'    route {pfx} blackhole;')
+                lines.append('}')
+
+            af_list = nbr.get('af_types', ['ipv4 unicast', 'ipv6 unicast'])
+            want4 = any('ipv4' in a for a in af_list)
+            want6 = any('ipv6' in a for a in af_list)
+
+            lines.append(f'protocol bgp {pname} {{')
+            lines.append(f'    local {local_addr} as {local_as};')
+            lines.append(f'    neighbor {ip} as {nbr["asn"]};')
+            lines.append('    hold time 30;')
+            if want4:
+                exp4 = f'export where proto = "static4_{pname}";' if adv4 else 'export none;'
+                lines.append('    ipv4 {')
+                lines.append('        import all;')
+                lines.append(f'        {exp4}')
+                lines.append('        next hop self;')
+                lines.append('    };')
+            if want6:
+                exp6 = f'export where proto = "static6_{pname}";' if adv6 else 'export none;'
+                lines.append('    ipv6 {')
+                lines.append('        import all;')
+                lines.append(f'        {exp6}')
+                lines.append('        next hop self;')
+                lines.append('    };')
             lines.append('}')
-            lines.append('')
-        if adv6:
-            lines.append(f'protocol static static6_{pname} {{')
-            lines.append('    ipv6;')
-            for pfx in adv6:
-                lines.append(f'    route {pfx} blackhole;')
-            lines.append('}')
-            lines.append('')
-
-        af_list = nbr.get('af_types', ['ipv4 unicast', 'ipv6 unicast'])
-        want4 = any('ipv4' in a for a in af_list)
-        want6 = any('ipv6' in a for a in af_list)
-
-        lines.append(f'protocol bgp {pname} {{')
-        lines.append(f'    local {local_addr} as {local_as};')
-        lines.append(f'    neighbor {ip} as {nbr["asn"]};')
-        lines.append('    hold time 30;')
-        if want4:
-            exp4 = f'export where proto = "static4_{pname}";' if adv4 else 'export none;'
-            lines.append('    ipv4 {')
-            lines.append('        import all;')
-            lines.append(f'        {exp4}')
-            lines.append('        next hop self;')
-            lines.append('    };')
-        if want6:
-            exp6 = f'export where proto = "static6_{pname}";' if adv6 else 'export none;'
-            lines.append('    ipv6 {')
-            lines.append('        import all;')
-            lines.append(f'        {exp6}')
-            lines.append('        next hop self;')
-            lines.append('    };')
-        lines.append('}')
-        lines.append('')
-
-    os.makedirs(os.path.dirname(BIRD_CONF), exist_ok=True)
-    with open(BIRD_CONF, 'w') as f:
-        f.write('\n'.join(lines) + '\n')
-    return active
+        active_total += ns_active
+        os.makedirs(os.path.dirname(cfg['conf']), exist_ok=True)
+        with open(cfg['conf'], 'w') as f:
+            f.write(chr(10).join(lines) + chr(10))
+    return active_total
 
 # ── Daemon lifecycle ──
 
@@ -684,73 +707,68 @@ def _bird_daemon_running():
     try:
         r = subprocess.run(['pgrep', '-x', 'bird'], capture_output=True, text=True, timeout=3)
         return bool(r.stdout.strip())
-    except Exception:
-        return False
+    except Exception: return False
 
 def _start_bird():
-    """(Re)load BIRD with the current config; start the daemon if needed."""
+    """Start BIRD in each namespace that has active neighbors."""
     global bgp_running
-    active = _build_bird_config()
+    active = _build_bird_configs()
     if active == 0:
         _stop_bird()
-        return False, "No active neighbors to start"
-    os.makedirs(os.path.dirname(BIRD_SOCK), exist_ok=True)
-    if _bird_daemon_running():
-        ok, out = _birdc('configure')
-        bgp_running = True
-        return (ok, "BGP reconfigured" if ok else out)
-    try:
-        r = subprocess.run([BIRD_BIN, '-c', BIRD_CONF, '-s', BIRD_SOCK],
-                           capture_output=True, text=True, timeout=8)
-        time.sleep(1)
-        if _bird_daemon_running():
-            bgp_running = True
-            return True, "BGP started"
-        bgp_running = False
-        return False, (r.stdout + r.stderr).strip() or "BIRD did not start"
-    except Exception as e:
-        bgp_running = False
-        return False, str(e)
+        return False, "No active neighbors"
+    ok_all = True
+    for ns, cfg in BIRD_NS.items():
+        os.makedirs(os.path.dirname(cfg['sock']), exist_ok=True)
+        # Check if BIRD already running in this namespace
+        _, out = _birdc_ns(ns, 'show', 'status')
+        running = 'BIRD' in (out or '')
+        if running:
+            ok, out2 = _birdc_ns(ns, 'configure')
+            if not ok: ok_all = False
+        else:
+            try:
+                r = subprocess.run(
+                    ['sudo', 'ip', 'netns', 'exec', ns, BIRD_BIN,
+                     '-c', cfg['conf'], '-s', cfg['sock']],
+                    capture_output=True, text=True, timeout=8)
+                time.sleep(1)
+                if not _bird_daemon_running():
+                    ok_all = False
+            except Exception:
+                ok_all = False
+    bgp_running = ok_all
+    return ok_all, "BGP started" if ok_all else "BIRD start failed"
 
 def _stop_bird():
-    """Stop the BIRD daemon."""
     global bgp_running
-    ok, _ = _birdc('down')
-    if not ok:
-        try:
-            subprocess.run(['pkill', '-x', 'bird'], timeout=5)
-        except Exception:
-            pass
+    for ns in BIRD_NS:
+        _birdc_ns(ns, 'down')
+    try: subprocess.run(['sudo', 'pkill', '-x', 'bird'], timeout=5)
+    except: pass
     bgp_running = False
 
 def _check_bgp_running():
-    """Check if BIRD is actually running."""
     global bgp_running
     bgp_running = _bird_daemon_running()
     return bgp_running
 
 # ── Live state parsing ──
 
-def _bird_show_protocols():
-    """Return {proto_name: info_string} for BGP protocols from birdc show protocols."""
-    ok, out = _birdc('show', 'protocols')
+def _bird_show_protocols_ns(ns):
+    ok, out = _birdc_ns(ns, 'show', 'protocols')
     protos = {}
-    if not ok:
-        return protos
+    if not ok: return protos
     for line in out.splitlines():
         toks = line.split()
         if len(toks) >= 2 and toks[1] == 'BGP':
-            # columns: Name Proto Table State Since [Info...]
             info = ' '.join(toks[5:]) if len(toks) > 5 else (toks[3] if len(toks) > 3 else '')
             protos[toks[0]] = info
     return protos
 
-def _bird_routes_for(pname):
-    """Return (v4, v6) lists of {prefix, next_hop} learned from a BGP protocol."""
+def _bird_routes_for_ns(ns, pname):
     v4, v6 = [], []
-    ok, out = _birdc('show', 'route', 'protocol', pname, 'all')
-    if not ok:
-        return v4, v6
+    ok, out = _birdc_ns(ns, 'show', 'route', 'protocol', pname, 'all')
+    if not ok: return v4, v6
     cur = None
     for line in out.splitlines():
         m = re.match(r'^([0-9a-fA-F:.]+/\d+)\b', line)
@@ -758,8 +776,7 @@ def _bird_routes_for(pname):
             cur = m.group(1)
             nh = ''
             mvia = re.search(r'via\s+(\S+)', line)
-            if mvia:
-                nh = mvia.group(1)
+            if mvia: nh = mvia.group(1)
             (v6 if ':' in cur else v4).append({'prefix': cur, 'next_hop': nh})
         else:
             mvia = re.search(r'via\s+(\S+)', line)
@@ -770,20 +787,21 @@ def _bird_routes_for(pname):
     return v4, v6
 
 def _parse_bird_live():
-    """Live BGP state keyed by neighbor IP (parallels the legacy exabgp parser)."""
-    protos = _bird_show_protocols()
+    """Aggregate live BGP state from ALL namespace BIRD instances."""
     result = {}
     for ip, nbr in bgp_neighbors.items():
+        ns = _ns_for_neighbor(ip)
+        if not ns: continue
         pname = _proto_name(ip)
+        protos = _bird_show_protocols_ns(ns)
         state = _bird_state_to_status(protos.get(pname))
         v4, v6 = ([], [])
         if state == 'established':
-            v4, v6 = _bird_routes_for(pname)
+            v4, v6 = _bird_routes_for_ns(ns, pname)
         result[ip] = {
             'state': state if state != 'unknown' else nbr.get('state', 'configured'),
             'asn': nbr.get('asn', 0),
-            'prefixes_v4': v4,
-            'prefixes_v6': v6,
+            'prefixes_v4': v4, 'prefixes_v6': v6,
         }
     return result
 
@@ -833,8 +851,6 @@ def bgp_status():
         'routes_v6': total_v6,
     })
 
-# ─── Neighbor CRUD ───
-
 @app.route('/api/bgp/neighbors', methods=['GET'])
 def bgp_list_neighbors():
     return jsonify({'success': True, 'neighbors': bgp_neighbors})
@@ -848,23 +864,18 @@ def bgp_add_neighbor():
         return jsonify({'success': False, 'error': 'Peer IP required'}), 400
     if ip in bgp_neighbors:
         return jsonify({'success': False, 'error': f'Neighbor {ip} already exists'}), 400
-
     asn = int(data.get('asn', 65001))
     description = data.get('description', '')
     af_types = data.get('af_types', ['ipv4 unicast', 'ipv6 unicast'])
     active = data.get('active', True)
-
     bgp_neighbors[ip] = {
-        'asn': asn,
-        'description': description,
-        'active': active,
-        'state': 'configured',
-        'learned_v4': [],
-        'learned_v6': [],
-        'advertised_v4': [],
-        'advertised_v6': [],
+        'asn': asn, 'description': description,
+        'active': active, 'state': 'configured',
+        'learned_v4': [], 'learned_v6': [],
+        'advertised_v4': [], 'advertised_v6': [],
         'af_types': af_types,
     }
+    _save_bgp_state()
     return jsonify({'success': True, 'message': f'Neighbor {ip} added', 'neighbor': bgp_neighbors[ip]})
 
 @app.route('/api/bgp/neighbors/<path:ip>', methods=['DELETE'])
@@ -874,7 +885,7 @@ def bgp_delete_neighbor(ip):
     if ip not in bgp_neighbors:
         return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
     del bgp_neighbors[ip]
-    # Re-render config so the peer is removed from BIRD too
+    _save_bgp_state()
     if any(v.get('active', True) for v in bgp_neighbors.values()):
         _start_bird()
     else:
@@ -888,6 +899,7 @@ def bgp_start_neighbor(ip):
         return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
     bgp_neighbors[ip]['active'] = True
     bgp_neighbors[ip]['state'] = 'starting'
+    _save_bgp_state()
     ok, msg = _start_bird()
     if ok:
         bgp_neighbors[ip]['state'] = 'connecting'
@@ -902,14 +914,13 @@ def bgp_stop_neighbor(ip):
         return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
     bgp_neighbors[ip]['active'] = False
     bgp_neighbors[ip]['state'] = 'stopped'
+    _save_bgp_state()
     active_neighbors = [k for k, v in bgp_neighbors.items() if v.get('active', True)]
     if active_neighbors:
-        _start_bird()  # reconfigure without this neighbor
+        _start_bird()
     else:
         _stop_bird()
     return jsonify({'success': True, 'message': f'Neighbor {ip} stopped'})
-
-# ─── Per-Neighbor Routes ───
 
 @app.route('/api/bgp/neighbors/<path:ip>/routes')
 def bgp_neighbor_routes(ip):
@@ -917,15 +928,12 @@ def bgp_neighbor_routes(ip):
     live = _parse_bird_live()
     nbr = bgp_neighbors.get(ip)
     live_info = live.get(ip, {})
-
     learned_v4 = live_info.get('prefixes_v4', nbr.get('learned_v4', []) if nbr else [])
     learned_v6 = live_info.get('prefixes_v6', nbr.get('learned_v6', []) if nbr else [])
     advertised_v4 = nbr.get('advertised_v4', []) if nbr else []
     advertised_v6 = nbr.get('advertised_v6', []) if nbr else []
-
     return jsonify({
-        'success': True,
-        'neighbor': ip,
+        'success': True, 'neighbor': ip,
         'learned': {'ipv4': learned_v4, 'ipv6': learned_v6},
         'advertised': {'ipv4': advertised_v4, 'ipv6': advertised_v6},
     })
@@ -939,16 +947,15 @@ def bgp_advertise_route(ip):
         return jsonify({'success': False, 'error': 'Prefix required'}), 400
     if ip not in bgp_neighbors:
         return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
-
     key = 'advertised_v6' if ':' in prefix else 'advertised_v4'
     if prefix not in bgp_neighbors[ip].setdefault(key, []):
         bgp_neighbors[ip][key].append(prefix)
-
-    ok, msg = _start_bird()  # rebuild config + birdc configure
+        _save_bgp_state()
+    ok, msg = _start_bird()
     if not ok:
-        # roll back the in-memory change on failure
         if prefix in bgp_neighbors[ip].get(key, []):
             bgp_neighbors[ip][key].remove(prefix)
+            _save_bgp_state()
         return jsonify({'success': False, 'error': msg}), 500
     return jsonify({'success': True, 'message': f'Advertised {prefix} to {ip}'})
 
@@ -961,21 +968,17 @@ def bgp_withdraw_route(ip):
         return jsonify({'success': False, 'error': 'Prefix required'}), 400
     if ip not in bgp_neighbors:
         return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
-
     key = 'advertised_v6' if ':' in prefix else 'advertised_v4'
     if prefix in bgp_neighbors[ip].get(key, []):
         bgp_neighbors[ip][key].remove(prefix)
-
+        _save_bgp_state()
     ok, msg = _start_bird()
     if not ok:
         return jsonify({'success': False, 'error': msg}), 500
     return jsonify({'success': True, 'message': f'Withdrawn {prefix} from {ip}'})
 
-# ─── Global Routes (for Traffic tab) ───
-
 @app.route('/api/bgp/routes')
 def bgp_all_routes():
-    """Return all BGP-learned routes (IPv4+IPv6) for traffic stream selection."""
     routes = []
     live = _parse_bird_live()
     for ip, info in live.items():

@@ -22,13 +22,13 @@ P0_DEV="enp8s0np0"      # -> 171
 P3_DEV="enp11s0np1"     # -> 172
 
 # IPERF mode addressing (per-link /31; switch side is .1 / .3)
-NS_171="iperf_ns2"; NS_171_IP="10.0.0.0/31"; NS_171_GW="10.0.0.1"
-NS_172="iperf_ns";  NS_172_IP="10.0.0.2/31"; NS_172_GW="10.0.0.3"
+NS_171="iperf_ns2"; NS_171_IP="10.0.0.2/31"; NS_171_GW="10.0.0.3"
+NS_172="iperf_ns";  NS_172_IP="10.20.0.0/31"; NS_172_GW="10.20.0.1"
 
 # TREX mode: both ports live in one namespace so a single TRex process sees both
 TREX_NS="trex_ns"
-TREX_P0_IP="10.0.0.0/31"
-TREX_P3_IP="10.0.0.2/31"
+TREX_P0_IP="10.0.0.2/31"
+TREX_P3_IP="10.20.0.0/31"
 
 log(){ echo "[netns-mode] $*"; }
 
@@ -68,6 +68,8 @@ setup_iperf() {
   ip netns exec "$NS_172" ip link set "$P3_DEV" up
   ip netns exec "$NS_172" ip link set lo up
   log "IPERF mode ready. iPerf3 / QoS tabs are now usable."
+  ip netns exec "$NS_171" ip route add default via $NS_171_GW 2>/dev/null
+  ip netns exec "$NS_172" ip route add default via $NS_172_GW 2>/dev/null
 }
 
 setup_trex() {
