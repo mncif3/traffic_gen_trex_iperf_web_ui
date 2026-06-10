@@ -819,7 +819,7 @@ function renderNamespaces(nsList){
         `<b style=\"color:#4f8cff;font-size:12px\">${ns.name}</b>`+
         `<span style=\"font-size:9px;color:#888\">${ns.description||''}</span>`+
         `<div class=\"btn-group\">`+
-          `<button class=\"small\" onclick=\"editNamespace('${ns.name}')\">✏️</button>`+
+          `<button class=\"small\" onclick=\"showNsForm('${ns.name}')\">✏️</button>`+
           `<button class=\"small danger\" onclick=\"deleteNamespace('${ns.name}')\">🗑</button>`+
         `</div>`+
       `</div>`;
