@@ -793,7 +793,6 @@ async function loadPorts(){
       return `<div style="background:#0f1119;border:1px solid #2a2d3a;border-radius:4px;padding:6px;margin-bottom:4px">
         <b>PORT ${p.port}</b> <span class="val ${p.link==='UP'?'green':'red'}">${p.link} @ ${p.speed}G</span> ${mode}<br>
         <span style="font-size:9px;color:#888">v4:${p.src_ip||'-'} → ${p.dest||'-'} | MAC:${p.src_mac||'-'}</span>${v6}</div>`}).join('')
-      </div>`).join(''):'Error';
   }catch(e){}
 }
 
