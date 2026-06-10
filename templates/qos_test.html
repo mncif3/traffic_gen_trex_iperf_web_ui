@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sea Group QoS DSCP Stream Test</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0f1119; color: #c9d1d9; font-family: 'Segoe UI', system-ui, sans-serif; padding: 20px; }
+  h1 { color: #4f8cff; margin-bottom: 8px; font-size: 1.4em; }
+  .subtitle { color: #6e7681; margin-bottom: 24px; font-size: 0.9em; }
+  
+  .panel { background: #161822; border: 1px solid #2a2d3a; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { color: #4f8cff; font-size: 1em; margin-bottom: 12px; }
+  
+  table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #2a2d3a; }
+  th { color: #6e7681; font-weight: 600; }
+  .highlight { color: #ff6b6b; }  /* PFC lossless */
+  .weight-high { color: #4f8cff; font-weight: bold; }
+  
+  .stream-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .stream-card { background: #1c1f2e; border: 1px solid #2a2d3a; border-radius: 6px; padding: 12px; text-align: center; }
+  .stream-card h3 { color: #4f8cff; font-size: 0.9em; margin-bottom: 4px; }
+  .stream-card .dscp { font-size: 1.5em; font-weight: bold; color: #c9d1d9; }
+  .stream-card .label { color: #6e7681; font-size: 0.8em; margin-bottom: 10px; }
+  .stream-card .result { font-size: 0.8em; margin-top: 6px; min-height: 1.2em; }
+  .stream-card .result.ok { color: #3fb950; }
+  .stream-card .result.err { color: #ff6b6b; }
+  
+  .btn-row { display: flex; gap: 6px; margin-top: 8px; justify-content: center; }
+  button {
+    background: #2a2d3a; color: #c9d1d9; border: 1px solid #3a3d4a;
+    padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 0.8em;
+  }
+  button:hover { background: #3a3d4a; }
+  button.run { background: #1a3a5c; border-color: #4f8cff; color: #4f8cff; }
+  button.run:hover { background: #243d5e; }
+  button.run:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.run-all { background: #4f8cff; color: #fff; border-color: #4f8cff; font-weight: bold; }
+  button.clear { background: #3a1a1a; border-color: #ff6b6b; color: #ff6b6b; }
+  
+  .switch-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .switch-card { background: #1c1f2e; border: 1px solid #2a2d3a; border-radius: 6px; padding: 10px; }
+  .switch-card h3 { color: #4f8cff; font-size: 0.85em; margin-bottom: 6px; }
+  .switch-card .queue-row { display: flex; justify-content: space-between; font-size: 0.8em; padding: 2px 0; border-bottom: 1px solid #2a2d3a; }
+  .switch-card .queue-row .pkts { color: #4f8cff; font-family: monospace; }
+  .switch-card .queue-row.active { background: #1a2a1a; }
+  
+  .log { background: #0a0c14; border: 1px solid #2a2d3a; border-radius: 4px; padding: 10px; font-family: monospace; font-size: 0.75em; max-height: 200px; overflow-y: auto; margin-top: 10px; }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #4f8cff; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 4px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<h1>🔬 Sea Group QoS DSCP Stream Test</h1>
+<div class="subtitle">174 → 171 (Eth513) → 172 (Eth512) → 174 (Eth513) | 10G ECMP</div>
+
+<!-- DSCP Mapping -->
+<div class="panel">
+  <h2>📋 DSCP → TC → Queue → PG Mapping</h2>
+  <table>
+    <thead><tr><th>DSCP</th><th>TC</th><th>Queue</th><th>PG</th><th>Label</th><th>Scheduler</th></tr></thead>
+    <tbody id="mapping-body"></tbody>
+  </table>
+</div>
+
+<!-- Stream Cards -->
+<div class="panel">
+  <h2>🚀 Run Streams</h2>
+  <div class="stream-grid" id="stream-grid"></div>
+  <div class="btn-row" style="margin-top:16px">
+    <button class="run-all" onclick="runAll('v4')">▶ Run All IPv4</button>
+    <button class="run-all" onclick="runAll('v6')">▶ Run All IPv6</button>
+    <button class="clear" onclick="clearCounters()">🗑 Clear Counters</button>
+  </div>
+</div>
+
+<!-- Switch Queue Counters -->
+<div class="panel">
+  <h2>🖥 Switch Queue Counters (Eth513)</h2>
+  <div class="switch-grid" id="switch-grid"></div>
+  <button onclick="refreshSwitches()" style="margin-top:10px">🔄 Refresh Counters</button>
+</div>
+
+<div class="log" id="log"></div>
+
+<script>
+const DSCP_CONFIG = {
+  8:  {tc:'0',q:'Q0',pg:'0',label:'CS0 (Best-Effort)',w:'10'},
+  24: {tc:'3',q:'Q3',pg:'3',label:'RDMA/RoCEv2 (PFC)',w:'90'},
+  32: {tc:'4',q:'Q4',pg:'4',label:'Lossless (PFC)',w:'-'},
+  48: {tc:'6',q:'Q6',pg:'0',label:'CNP/STRICT',w:'-'}
+};
+
+function log(msg) {
+  const el = document.getElementById('log');
+  el.innerHTML += `[${new Date().toLocaleTimeString()}] ${msg}<br>`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderMapping() {
+  const tbody = document.getElementById('mapping-body');
+  for (const [dscp, cfg] of Object.entries(DSCP_CONFIG)) {
+    const pgClass = cfg.pg !== '0' ? ' class="highlight"' : '';
+    const wClass = cfg.w === '90' ? ' class="weight-high"' : '';
+    tbody.innerHTML += `<tr>
+      <td><b>${dscp}</b></td><td>TC${cfg.tc}</td><td>${cfg.q}</td>
+      <td${pgClass}>PG${cfg.pg}</td><td>${cfg.label}</td>
+      <td${wClass}>${cfg.w !== '-' ? 'DWRR='+cfg.w : '-'}</td>
+    </tr>`;
+  }
+}
+
+function renderStreams() {
+  const grid = document.getElementById('stream-grid');
+  for (const [dscp, cfg] of Object.entries(DSCP_CONFIG)) {
+    grid.innerHTML += `<div class="stream-card" id="card-${dscp}">
+      <h3>DSCP ${dscp}</h3>
+      <div class="dscp">${cfg.q}</div>
+      <div class="label">${cfg.label}</div>
+      <div class="btn-row">
+        <button class="run" onclick="runStream(${dscp}, false)">IPv4</button>
+        <button class="run" onclick="runStream(${dscp}, true)">IPv6</button>
+      </div>
+      <div class="result" id="result-${dscp}-v4">—</div>
+      <div class="result" id="result-${dscp}-v6">—</div>
+    </div>`;
+  }
+}
+
+async function runStream(dscp, ipv6) {
+  const proto = ipv6 ? 'v6' : 'v4';
+  const resultEl = document.getElementById(`result-${dscp}-${proto}`);
+  const btn = event.target;
+  btn.disabled = true;
+  resultEl.innerHTML = '<span class="spinner"></span> running...';
+  resultEl.className = 'result';
+  log(`Starting DSCP=${dscp} ${ipv6?'IPv6':'IPv4'}...`);
+
+  try {
+    const resp = await fetch('/api/qos/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dscp, ipv6, duration: 3})
+    });
+    const data = await resp.json();
+    if (data.success && data.throughput_gbps) {
+      resultEl.innerHTML = `✅ ${data.throughput_gbps} Gbps`;
+      resultEl.className = 'result ok';
+      log(`DSCP=${dscp} ${proto}: ${data.throughput_gbps} Gbps, retrans=${data.retransmits}`);
+    } else {
+      resultEl.innerHTML = '❌ failed';
+      resultEl.className = 'result err';
+      log(`DSCP=${dscp} ${proto}: FAILED - ${data.error || 'no throughput'}`);
+    }
+  } catch (e) {
+    resultEl.innerHTML = '❌ error';
+    resultEl.className = 'result err';
+    log(`DSCP=${dscp} ${proto}: ${e.message}`);
+  }
+  btn.disabled = false;
+  refreshSwitches();
+}
+
+async function runAll(proto) {
+  for (const dscp of Object.keys(DSCP_CONFIG)) {
+    const ipv6 = proto === 'v6';
+    await fetch('/api/qos/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dscp: parseInt(dscp), ipv6, duration: 2})
+    }).then(r => r.json()).then(data => {
+      const resultEl = document.getElementById(`result-${dscp}-${proto}`);
+      if (data.success && data.throughput_gbps) {
+        resultEl.innerHTML = `✅ ${data.throughput_gbps} Gbps`;
+        resultEl.className = 'result ok';
+      }
+    }).catch(() => {});
+  }
+  refreshSwitches();
+}
+
+async function refreshSwitches() {
+  try {
+    const resp = await fetch('/api/qos/switches');
+    const data = await resp.json();
+    const grid = document.getElementById('switch-grid');
+    grid.innerHTML = '';
+    for (const [ip, sw] of Object.entries(data.switches)) {
+      let html = `<div class="switch-card"><h3>${ip} — ${sw.iface}</h3>`;
+      if (sw.error) {
+        html += `<div style="color:#ff6b6b">${sw.error}</div>`;
+      } else {
+        for (const [q, pkts] of Object.entries(sw.queues || {})) {
+          const active = pkts > 1000 ? ' active' : '';
+          html += `<div class="queue-row${active}"><span>${q}</span><span class="pkts">${pkts.toLocaleString()}</span></div>`;
+        }
+      }
+      html += '</div>';
+      grid.innerHTML += html;
+    }
+  } catch (e) {
+    log('Switch refresh error: ' + e.message);
+  }
+}
+
+async function clearCounters() {
+  await fetch('/api/qos/clear_counters', {method:'POST'});
+  log('Counters cleared');
+  refreshSwitches();
+}
+
+// Init
+renderMapping();
+renderStreams();
+refreshSwitches();
+setInterval(refreshSwitches, 5000);
+</script>
+</body>
+</html>
