@@ -1091,8 +1091,10 @@ async function addStream(){
       body:JSON.stringify(payload)
     });
     const d=await r.json();
-    if(d.success)loadStreams();
-    else alert('Failed: '+d.error);
+    if(d.success){
+      loadStreams();
+      if(d.warning)console.log('TRex stream saved (offline):',d.warning);
+    }else alert('Failed: '+d.error);
   }catch(e){alert('Error: '+e)}
 }
 

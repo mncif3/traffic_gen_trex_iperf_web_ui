@@ -1394,7 +1394,18 @@ def api_create_stream():
 
         c = get_trex_client(host)
         if not c:
-            return jsonify({'success': False, 'error': f'Host {host} not connected'}), 500
+            # TRex not running — save stream config for later use
+            current_streams[name] = {
+                'name': name, 'host': host, 'port': port,
+                'src_ip': src_ip, 'dst_ip': dst_ip, 'dst_mac': dst_mac,
+                'protocol': protocol, 'pps': pps, 'pkt_size': pkt_size, 'bw_mbps': actual_bw,
+                'src_port': src_port, 'dst_port': dst_port,
+                'dscp': dscp, 'vlan_id': vlan_id,
+                'pg_id': pg_id, 'latency_enabled': enable_latency,
+                'ipv6': ipv6, 'pending': True
+            }
+            return jsonify({'success': True, 'stream': current_streams[name],
+                          'warning': 'TRex not running — stream saved, will apply when TRex starts'})
 
         c.reset(ports=[port])
         c.remove_all_streams(ports=[port])
