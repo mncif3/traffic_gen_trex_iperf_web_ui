@@ -1072,9 +1072,10 @@ async function deleteNamespace(name){
 
 async function addStream(){
   const vlan=$('s-vlan').value;
+  const name=$('s-name').value;
   const payload={
     host:$('s-host').value,port:parseInt($('s-port').value),
-    name:$('s-name').value,
+    name:name,
     src_ip:$('s-src').value,dst_ip:$('s-dst').value,
     dst_mac:$('s-mac').value,dst_mac_mode:$('s-mac-mode').value,
     protocol:$('s-proto').value,
@@ -1086,8 +1087,11 @@ async function addStream(){
   if(vlan)payload.vlan_id=parseInt(vlan);
 
   try{
-    const r=await fetch(API+'/api/streams',{
-      method:'POST',headers:{'Content-Type':'application/json'},
+    const exists=window._streams&&window._streams[name];
+    const method=exists?'PUT':'POST';
+    const url=exists?API+'/api/streams/'+encodeURIComponent(name):API+'/api/streams';
+    const r=await fetch(url,{
+      method:method,headers:{'Content-Type':'application/json'},
       body:JSON.stringify(payload)
     });
     const d=await r.json();
@@ -1116,20 +1120,59 @@ async function loadStreams(){
     const r=await fetch(API+'/api/streams');
     const d=await r.json();
     const div=$('stream-list');
+    window._streams=d.streams||{};
     if(!d.streams||Object.keys(d.streams).length===0){
       div.innerHTML='<em style="color:#555">No stream blocks</em>';return
     }
     div.innerHTML=Object.values(d.streams).map(s=>`
-      <div style="font-size:9px;padding:3px 0;border-bottom:1px solid #1e2230">
-        <b>${s.name}</b> P${s.port} ${s.src_ip}:${s.src_port}→${s.dst_ip}:${s.dst_port}
-        [${s.pps}pps/${s.bw_mbps}Mbps] ${s.dscp?'DSCP'+s.dscp:''} ${s.vlan_id?'VLAN'+s.vlan_id:''} ${s.latency_enabled?'⏱':''}
-        <button class="danger small" onclick="delStream('${s.name}')" style="float:right">✕</button>
+      <div style="font-size:9px;padding:5px 0;border-bottom:1px solid #1e2230;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:4px">
+        <span style="flex:1;min-width:200px">
+          <b>${s.name}</b> P${s.port} ${s.src_ip}:${s.src_port}→${s.dst_ip}:${s.dst_port}
+          [${s.pps}pps/${s.bw_mbps}Mbps] ${s.dscp?'DSCP'+s.dscp:''} ${s.vlan_id?'VLAN'+s.vlan_id:''} ${s.latency_enabled?'⏱':''}
+          ${s.pending?'<span style="color:#e8a838;font-size:8px">[pending]</span>':''}
+        </span>
+        <span style="display:flex;gap:3px;flex-shrink:0">
+          <button class="small" onclick="editStream('${s.name}')" title="Edit" style="background:#2a2d3a;color:#4f8cff;border:1px solid #3a3d4a;padding:2px 6px;font-size:9px">✎</button>
+          <button class="small" onclick="startStreamPort(${s.port})" title="Start" style="background:#1a3a1a;color:#4caf50;border:1px solid #2a5a2a;padding:2px 6px;font-size:9px">▶</button>
+          <button class="danger small" onclick="delStream('${s.name}')" title="Delete">✕</button>
+        </span>
       </div>`).join('');
   }catch(e){}
 }
 
-async function delStream(n){
-  await fetch(API+'/api/streams/'+n,{method:'DELETE'});loadStreams();
+async function editStream(n){
+  const s=window._streams&&window._streams[n];
+  if(!s)return;
+  $('s-host').value=s.host||'local';
+  $('s-port').value=s.port||0;
+  $('s-name').value=s.name;
+  $('s-proto').value=s.protocol||'udp';
+  $('s-src').value=s.src_ip||'';
+  $('s-dst').value=s.dst_ip||'';
+  $('s-mac').value=s.dst_mac||'';
+  $('s-sport').value=s.src_port||1234;
+  $('s-dport').value=s.dst_port||5678;
+  $('s-size').value=s.pkt_size||64;
+  $('s-pps').value=s.pps||1000;
+  $('s-bw').value=s.bw_mbps||0;
+  $('s-dscp').value=s.dscp||0;
+  $('s-vlan').value=s.vlan_id||'';
+  $('s-pgid').value=s.pg_id||7;
+  $('s-latency').checked=s.latency_enabled!==false;
+  // Switch tab to Stream Builder
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.querySelector('.tab-btn')?.classList.add('active');
+  document.querySelectorAll('.tab-panel').forEach(p=>p.style.display='none');
+  const panel=document.getElementById('tab-stream');
+  if(panel)panel.style.display='block';
+  // Scroll to form
+  $('s-name').scrollIntoView({behavior:'smooth'});
+}
+
+async function startStreamPort(port){
+  await fetch(API+'/api/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ports:[port],duration:-1,host:'local'})});
+  startStatsPoll();
 }
 
 async function startTraffic(){

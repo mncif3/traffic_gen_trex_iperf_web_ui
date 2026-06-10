@@ -1446,6 +1446,104 @@ def api_delete_stream(name):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/streams/<name>', methods=['PUT'])
+def api_update_stream(name):
+    """Update an existing stream — delete old, create new with same name."""
+    try:
+        data = request.json
+        # Delete old stream first
+        old = current_streams.pop(name, None)
+        if old:
+            c = get_trex_client(old.get('host', 'local'))
+            if c:
+                try:
+                    c.remove_all_streams(ports=[old['port']])
+                except:
+                    pass
+
+        host = data.get('host', 'local')
+        port = int(data.get('port', 0))
+        src_ip = data.get('src_ip', '10.0.0.0')
+        dst_ip = data.get('dst_ip', '10.0.0.1')
+        ipv6 = ':' in dst_ip
+
+        dst_mac_mode = data.get('dst_mac_mode', 'manual')
+        dst_mac = data.get('dst_mac', 'e8:e4:9d:00:30:58')
+        if dst_mac_mode == 'arp':
+            resolved = arp_resolve(dst_ip)
+            if resolved:
+                dst_mac = resolved
+        elif dst_mac_mode == 'gateway':
+            gw_mac = get_gateway_mac()
+            if gw_mac:
+                dst_mac = gw_mac
+
+        protocol = data.get('protocol', 'udp')
+        src_port = int(data.get('src_port', 1234))
+        dst_port = int(data.get('dst_port', 5678))
+        pps = int(data.get('pps', 1000))
+        bw_mbps = data.get('bw_mbps', 0)
+        pkt_size = int(data.get('pkt_size', 64))
+        if bw_mbps > 0:
+            pps = bandwidth_to_pps(bw_mbps, pkt_size)
+        actual_bw = pps_to_bandwidth(pps, pkt_size)
+        dscp = int(data.get('dscp', 0))
+        vlan_id = data.get('vlan_id', None)
+        enable_latency = data.get('enable_latency', True)
+        pg_id = int(data.get('pg_id', 7))
+
+        # Build packet
+        if ipv6:
+            pkt = Ether(dst=dst_mac) / IPv6(src=src_ip, dst=dst_ip, tc=dscp >> 2)
+        else:
+            pkt = Ether(dst=dst_mac) / IP(src=src_ip, dst=dst_ip, tos=dscp << 2)
+        if vlan_id is not None and int(vlan_id) > 0:
+            pkt = pkt / Dot1Q(vlan=int(vlan_id))
+        if protocol == 'udp':
+            pkt = pkt / UDP(sport=src_port, dport=dst_port)
+        else:
+            pkt = pkt / TCP(sport=src_port, dport=dst_port)
+        pkt = pkt / Raw(data.get('payload', 'TRex_WebGUI_v4').encode()[:pkt_size])
+
+        c = get_trex_client(host)
+        if not c:
+            current_streams[name] = {
+                'name': name, 'host': host, 'port': port,
+                'src_ip': src_ip, 'dst_ip': dst_ip, 'dst_mac': dst_mac,
+                'protocol': protocol, 'pps': pps, 'pkt_size': pkt_size, 'bw_mbps': actual_bw,
+                'src_port': src_port, 'dst_port': dst_port,
+                'dscp': dscp, 'vlan_id': vlan_id,
+                'pg_id': pg_id, 'latency_enabled': enable_latency,
+                'ipv6': ipv6, 'pending': True
+            }
+            return jsonify({'success': True, 'stream': current_streams[name],
+                          'warning': 'TRex not running — stream saved, will apply when TRex starts'})
+
+        c.reset(ports=[port])
+        c.remove_all_streams(ports=[port])
+        stream_kwargs = {
+            'name': name,
+            'packet': STLPktBuilder(pkt=pkt),
+            'mode': STLTXCont(pps=pps),
+        }
+        if enable_latency:
+            stream_kwargs['flow_stats'] = STLFlowLatencyStats(pg_id=pg_id)
+        stream = STLStream(**stream_kwargs)
+        c.add_streams(stream, ports=[port])
+
+        current_streams[name] = {
+            'name': name, 'host': host, 'port': port,
+            'src_ip': src_ip, 'dst_ip': dst_ip, 'dst_mac': dst_mac,
+            'protocol': protocol, 'pps': pps, 'pkt_size': pkt_size, 'bw_mbps': actual_bw,
+            'src_port': src_port, 'dst_port': dst_port,
+            'dscp': dscp, 'vlan_id': vlan_id,
+            'pg_id': pg_id, 'latency_enabled': enable_latency,
+            'ipv6': ipv6
+        }
+        return jsonify({'success': True, 'stream': current_streams[name]})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/start', methods=['POST'])
 def api_start():
     try:
