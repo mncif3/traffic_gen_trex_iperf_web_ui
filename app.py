@@ -39,9 +39,9 @@ def _load_bgp_state():
 
 # BIRD runs inside data-plane namespaces (source IP = namespace IP)
 BIRD_NS = {
-    'iperf_ns2': {'local_ip': '10.0.0.2', 'switch_ip': '10.0.0.3',
+    'iperf_ns2': {'local_ip': '10.0.0.2', 'local_ipv6': '2001:db8:513::2', 'switch_ip': '10.0.0.3',
                   'conf': '/tmp/bird/ns2.conf', 'sock': '/tmp/bird/ns2.ctl'},
-    'iperf_ns':  {'local_ip': '10.20.0.0', 'switch_ip': '10.20.0.1',
+    'iperf_ns':  {'local_ip': '10.20.0.0', 'local_ipv6': '2001:db8:514::2', 'switch_ip': '10.20.0.1',
                   'conf': '/tmp/bird/ns.conf',  'sock': '/tmp/bird/ns.ctl'},
 }
 BIRD_BIN = '/usr/sbin/bird'
@@ -51,6 +51,9 @@ def _ns_for_neighbor(ip):
     if '.' in ip:
         if ip.startswith('10.0.0.'): return 'iperf_ns2'
         if ip.startswith('10.20.0.'): return 'iperf_ns'
+    elif ':' in ip:
+        if '2001:db8:513:' in ip: return 'iperf_ns2'
+        if '2001:db8:514:' in ip: return 'iperf_ns'
     return None
 
 _load_bgp_state()
@@ -657,7 +660,7 @@ def _build_bird_configs():
             ns_active += 1
             pname = _proto_name(ip)
             is_v6 = ':' in ip
-            local_addr = _get_local_ipv6() if is_v6 else cfg['local_ip']
+            local_addr = cfg.get('local_ipv6', _get_local_ipv6()) if is_v6 else cfg['local_ip']
 
             adv4 = nbr.get('advertised_v4', [])
             adv6 = nbr.get('advertised_v6', [])
