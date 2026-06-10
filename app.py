@@ -1075,6 +1075,213 @@ def api_ports():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# ═══════════════════ Namespace Management ═══════════════════
+
+NS_CONFIG_FILE = '/opt/trex-web/ns_config.json'
+
+def _load_ns_config():
+    try:
+        with open(NS_CONFIG_FILE) as f:
+            return json.load(f)
+    except:
+        return {}
+
+def _save_ns_config(config):
+    with open(NS_CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def _get_ns_live_status(ns_name):
+    """Get live namespace status: interfaces, IPs, routes."""
+    try:
+        interfaces = {}
+        # IPv4 addresses
+        r4 = subprocess.run(['sudo', 'ip', 'netns', 'exec', ns_name, 'ip', '-4', '-o', 'addr', 'show'],
+                           capture_output=True, text=True, timeout=5)
+        if r4.returncode != 0:
+            return None
+        for line in r4.stdout.strip().split('\n'):
+            if not line: continue
+            parts = line.split()
+            iface = parts[1]; ip = parts[3]
+            if iface not in interfaces: interfaces[iface] = {}
+            interfaces[iface]['ipv4'] = ip
+
+        # IPv6 addresses (skip link-local)
+        r6 = subprocess.run(['sudo', 'ip', 'netns', 'exec', ns_name, 'ip', '-6', '-o', 'addr', 'show'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r6.stdout.strip().split('\n'):
+            if not line or 'scope link' in line: continue
+            parts = line.split()
+            iface = parts[1]; ip = parts[3]
+            if iface in interfaces:
+                interfaces[iface]['ipv6'] = ip
+
+        # IPv4 routes (skip kernel proto, keep default + static)
+        routes = []
+        r_route = subprocess.run(['sudo', 'ip', 'netns', 'exec', ns_name, 'ip', '-4', 'route', 'show'],
+                                capture_output=True, text=True, timeout=5)
+        for line in r_route.stdout.strip().split('\n'):
+            if not line or 'proto kernel' in line: continue
+            routes.append({'af': 'ipv4', 'route': line.strip()})
+
+        # IPv6 routes
+        r6_route = subprocess.run(['sudo', 'ip', 'netns', 'exec', ns_name, 'ip', '-6', 'route', 'show'],
+                                 capture_output=True, text=True, timeout=5)
+        for line in r6_route.stdout.strip().split('\n'):
+            if not line or 'proto kernel' in line or 'fe80::/64' in line: continue
+            routes.append({'af': 'ipv6', 'route': line.strip()})
+
+        return {'interfaces': interfaces, 'routes': routes}
+    except:
+        return None
+
+@app.route('/api/namespaces', methods=['GET'])
+def api_list_namespaces():
+    config = _load_ns_config()
+    try:
+        r = subprocess.run(['ip', 'netns', 'list'], capture_output=True, text=True, timeout=5)
+        ns_list = [line.split()[0] for line in r.stdout.strip().split('\n') if line]
+    except:
+        ns_list = []
+
+    result = []
+    for ns_name in ns_list:
+        live = _get_ns_live_status(ns_name)
+        cfg = config.get(ns_name, {})
+        result.append({
+            'name': ns_name,
+            'description': cfg.get('description', ns_name),
+            'interface': cfg.get('interface', ''),
+            'ipv4': cfg.get('ipv4', ''),
+            'ipv6': cfg.get('ipv6', ''),
+            'gateway': cfg.get('gateway', ''),
+            'gateway6': cfg.get('gateway6', ''),
+            'static_routes': cfg.get('static_routes', []),
+            'live': live
+        })
+
+    return jsonify({'success': True, 'namespaces': result})
+
+@app.route('/api/namespaces', methods=['POST'])
+def api_create_namespace():
+    data = request.get_json()
+    name = data.get('name', '').strip()
+    if not name:
+        return jsonify({'success': False, 'error': 'Name required'}), 400
+
+    config = _load_ns_config()
+    config[name] = {
+        'description': data.get('description', name),
+        'interface': data.get('interface', ''),
+        'ipv4': data.get('ipv4', ''),
+        'ipv6': data.get('ipv6', ''),
+        'gateway': data.get('gateway', ''),
+        'gateway6': data.get('gateway6', ''),
+        'static_routes': data.get('static_routes', [])
+    }
+    _save_ns_config(config)
+
+    if data.get('apply'):
+        try:
+            r = subprocess.run(['ip', 'netns', 'list'], capture_output=True, text=True)
+            if name not in r.stdout:
+                subprocess.run(['sudo', 'ip', 'netns', 'add', name], check=True, timeout=10)
+
+            iface = data.get('interface', '')
+            if iface:
+                # Move from root if present there
+                subprocess.run(['sudo', 'ip', 'link', 'set', iface, 'netns', name], check=True, timeout=10)
+
+            if data.get('ipv4'):
+                subprocess.run(['sudo', 'ip', 'netns', 'exec', name, 'ip', 'addr', 'add',
+                              data['ipv4'], 'dev', iface], check=True, timeout=10)
+            if data.get('ipv6'):
+                subprocess.run(['sudo', 'ip', 'netns', 'exec', name, 'ip', '-6', 'addr', 'add',
+                              data['ipv6'], 'dev', iface], check=True, timeout=10)
+
+            subprocess.run(['sudo', 'ip', 'netns', 'exec', name, 'ip', 'link', 'set', iface, 'up'],
+                          check=True, timeout=10)
+            subprocess.run(['sudo', 'ip', 'netns', 'exec', name, 'ip', 'link', 'set', 'lo', 'up'],
+                          check=True, timeout=10)
+
+            if data.get('gateway'):
+                subprocess.run(['sudo', 'ip', 'netns', 'exec', name, 'ip', 'route', 'add',
+                              'default', 'via', data['gateway']], check=False, timeout=10)
+
+            for route in data.get('static_routes', []):
+                prefix = route.get('prefix', '')
+                via = route.get('next_hop', '')
+                if prefix and via:
+                    af = '-6' if ':' in prefix else ''
+                    cmd = ['sudo', 'ip', 'netns', 'exec', name, 'ip', 'route', 'add', prefix, 'via', via]
+                    if af:
+                        cmd.insert(5, af)
+                    subprocess.run(cmd, check=False, timeout=10)
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    return jsonify({'success': True, 'namespace': config[name]})
+
+@app.route('/api/namespaces/<name>', methods=['PUT'])
+def api_update_namespace(name):
+    data = request.get_json()
+    config = _load_ns_config()
+    if name not in config:
+        return jsonify({'success': False, 'error': 'Namespace not found'}), 404
+
+    for field in ['description', 'interface', 'ipv4', 'ipv6', 'gateway', 'gateway6', 'static_routes']:
+        if field in data:
+            config[name][field] = data[field]
+    _save_ns_config(config)
+    return jsonify({'success': True, 'namespace': config[name]})
+
+@app.route('/api/namespaces/<name>', methods=['DELETE'])
+def api_delete_namespace(name):
+    config = _load_ns_config()
+    if name in config:
+        del config[name]
+        _save_ns_config(config)
+    try:
+        subprocess.run(['sudo', 'ip', 'netns', 'del', name], check=False, timeout=10)
+    except:
+        pass
+    return jsonify({'success': True})
+
+@app.route('/api/namespaces/ports', methods=['GET'])
+def api_available_ports():
+    """List available 10G physical ports (X710 family) for namespace assignment."""
+    try:
+        r = subprocess.run(['ip', '-br', 'link', 'show'], capture_output=True, text=True, timeout=5)
+        all_ifaces = {}
+        for line in r.stdout.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 2:
+                all_ifaces[parts[0]] = {'state': parts[1], 'mac': parts[2] if len(parts) > 2 else ''}
+
+        x710_ports = ['enp8s0np0', 'enp9s0np3', 'enp10s0np2', 'enp11s0np1']
+        in_ns = set()
+        try:
+            r_ns = subprocess.run(['ip', 'netns', 'list'], capture_output=True, text=True, timeout=5)
+            for ns in [l.split()[0] for l in r_ns.stdout.strip().split('\n') if l]:
+                r_links = subprocess.run(['sudo', 'ip', 'netns', 'exec', ns, 'ip', '-br', 'link', 'show'],
+                                        capture_output=True, text=True, timeout=5)
+                for line in r_links.stdout.strip().split('\n'):
+                    iface = line.split()[0] if line else ''
+                    if iface: in_ns.add(iface)
+        except:
+            pass
+
+        ports = []
+        for p in x710_ports:
+            info = all_ifaces.get(p, {'state': 'UNKNOWN', 'mac': ''})
+            ports.append({
+                'name': p, 'state': info['state'], 'mac': info['mac'],
+                'in_namespace': p in in_ns
+            })
+        return jsonify({'success': True, 'ports': ports})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # ═══════════════════ Enhanced Stats ═══════════════════
 
 @app.route('/api/stats')

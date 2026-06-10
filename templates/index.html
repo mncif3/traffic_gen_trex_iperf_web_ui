@@ -163,6 +163,41 @@ hr{border:none;border-top:1px solid #2a2d3a;margin:8px 0}
     </div>
   </div>
 
+  <!-- ═══ Namespace Management ═══ -->
+  <div class="panel" style="margin:0 8px 8px">
+    <h2>🌐 Namespaces <button class="small primary" onclick="showNsForm()" style="float:right">+ New</button></h2>
+    <div id="namespace-list" style="font-size:11px;color:#555">Loading...</div>
+    
+    <!-- Inline edit/create form (hidden by default) -->
+    <div id="ns-form" style="display:none;margin-top:8px;padding:8px;background:#161822;border:1px solid #2a2d3a;border-radius:4px">
+      <h3 id="ns-form-title" style="font-size:13px;color:#4f8cff;margin-bottom:8px">New Namespace</h3>
+      <input type="hidden" id="ns-edit-mode" value="create">
+      <div class="form-row">
+        <label>Name</label><input id="ns-name" placeholder="my_namespace" size="15">
+        <label>Desc</label><input id="ns-desc" placeholder="Description" size="20">
+        <label>Interface</label><select id="ns-iface"><option value="">-- Select port --</option></select>
+      </div>
+      <div class="form-row">
+        <label>IPv4</label><input id="ns-ipv4" placeholder="10.0.0.2/31" size="18">
+        <label>IPv6</label><input id="ns-ipv6" placeholder="2001:db8::2/64" size="24">
+      </div>
+      <div class="form-row">
+        <label>Gateway</label><input id="ns-gw" placeholder="10.0.0.3" size="15">
+        <label>Gateway6</label><input id="ns-gw6" placeholder="2001:db8::1" size="24">
+      </div>
+      <!-- Static Routes -->
+      <div style="margin-top:6px">
+        <label style="font-size:11px;color:#888">Static Routes</label>
+        <div id="ns-routes-list"></div>
+        <button class="small" onclick="addNsRoute()" style="margin-top:4px">+ Add Route</button>
+      </div>
+      <div class="btn-group" style="margin-top:8px">
+        <button class="primary" onclick="saveNamespace()">💾 Save</button>
+        <button onclick="hideNsForm()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <div class="panel" style="margin:0 8px 8px">
     <h2>📝 Create Stream Block</h2>
 
@@ -388,7 +423,7 @@ function switchTab(t){
   document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));
   event.target.classList.add('active');$('tab-'+t).classList.add('active');
   if(t==='bgp')refreshBgp();
-  if(t==='traffic'){loadPorts();loadStreams();populateBgpRoutes();}
+  if(t==='traffic'){loadPorts();loadStreams();populateBgpRoutes();loadNamespaces();}
   if(t==='stats')loadStats();
   if(t==='hosts')loadHosts();
   if(t==='iperf'){loadIperfInterfaces();refreshIperf();}
@@ -755,6 +790,169 @@ function recalcBw(){
   const bw=parseFloat($('s-bw').value)||0;
   const size=parseInt($('s-size').value)||64;
   $('s-pps').value=Math.round(bw*1e6/((size+20)*8));
+}
+
+// ══════════ Namespace Management ══════════
+
+let nsAllPorts=[];
+
+async function loadNamespaces(){
+  try{
+    const r=await fetch(API+'/api/namespaces');
+    const d=await r.json();
+    if(!d.success)return;
+    renderNamespaces(d.namespaces||[]);
+  }catch(e){}
+}
+
+function renderNamespaces(nsList){
+  const div=$('namespace-list');
+  if(!nsList.length){div.innerHTML='<em style=\"color:#555\">No namespaces found</em>';return;}
+  let html='';
+  nsList.forEach(ns=>{
+    const live=ns.live||{};
+    const ifaces=live.interfaces||{};
+    const ifaceKeys=Object.keys(ifaces);
+    const routes=live.routes||[];
+    html+=`<div class=\"stat-card\" style=\"text-align:left;position:relative\">`+
+      `<div style=\"display:flex;justify-content:space-between;align-items:center\">`+
+        `<b style=\"color:#4f8cff;font-size:12px\">${ns.name}</b>`+
+        `<span style=\"font-size:9px;color:#888\">${ns.description||''}</span>`+
+        `<div class=\"btn-group\">`+
+          `<button class=\"small\" onclick=\"editNamespace('${ns.name}')\">✏️</button>`+
+          `<button class=\"small danger\" onclick=\"deleteNamespace('${ns.name}')\">🗑</button>`+
+        `</div>`+
+      `</div>`;
+    if(ifaceKeys.length){
+      ifaceKeys.forEach(iface=>{
+        const info=ifaces[iface];
+        html+=`<div style=\"font-size:10px;color:#aaa;margin-top:2px\">`+
+          `📡 ${iface} | v4:${info.ipv4||'-'} | v6:${info.ipv6||'-'}`+
+        `</div>`;
+      });
+    }else{
+      html+=`<div style=\"font-size:10px;color:#555\">(no interfaces detected)</div>`;
+    }
+    if(routes.length){
+      html+=`<div style=\"font-size:9px;color:#666;margin-top:3px\">Routes:</div>`;
+      routes.forEach(r=>{
+        html+=`<div style=\"font-size:9px;color:#888;margin-left:8px\">`+
+          `<span style=\"color:${r.af==='ipv6'?'#4f8cff':'#e0e0e0'}\">${r.af}</span> ${r.route}`+
+        `</div>`;
+      });
+    }
+    if(ns.ipv4||ns.ipv6||ns.gateway){
+      html+=`<div style=\"font-size:9px;color:#555;margin-top:4px;border-top:1px solid #2a2d3a;padding-top:3px\">`+
+        `Config: ${ns.ipv4||''} ${ns.ipv6?'| '+ns.ipv6:''} ${ns.gateway?'GW:'+ns.gateway:''}`+
+      `</div>`;
+    }
+    html+=`</div>`;
+  });
+  div.innerHTML=html;
+}
+
+async function loadAvailablePorts(){
+  try{
+    const r=await fetch(API+'/api/namespaces/ports');
+    const d=await r.json();
+    if(d.success)nsAllPorts=d.ports||[];
+  }catch(e){}
+}
+
+function populatePortSelect(selected){
+  const sel=$('ns-iface');
+  sel.innerHTML='<option value=\"\">-- Select port --</option>';
+  nsAllPorts.forEach(p=>{
+    const label=p.name+' | '+p.state+(p.in_namespace?' [in ns]':'');
+    const selAttr=(selected===p.name)?' selected':'';
+    sel.innerHTML+=`<option value=\"${p.name}\"${selAttr}>${label}</option>`;
+  });
+}
+
+function showNsForm(name){
+  loadAvailablePorts().then(()=>{
+    $('ns-form').style.display='block';
+    if(name){
+      $('ns-form-title').textContent='Edit Namespace: '+name;
+      $('ns-edit-mode').value='edit';
+      $('ns-name').value=name;
+      $('ns-name').disabled=true;
+      fetch(API+'/api/namespaces').then(r=>r.json()).then(d=>{
+        if(!d.success)return;
+        const ns=(d.namespaces||[]).find(n=>n.name===name);
+        if(!ns)return;
+        $('ns-desc').value=ns.description||'';
+        $('ns-ipv4').value=ns.ipv4||'';
+        $('ns-ipv6').value=ns.ipv6||'';
+        $('ns-gw').value=ns.gateway||'';
+        $('ns-gw6').value=ns.gateway6||'';
+        populatePortSelect(ns.interface);
+        renderNsRoutes(ns.static_routes||[]);
+      });
+    }else{
+      $('ns-form-title').textContent='New Namespace';
+      $('ns-edit-mode').value='create';
+      $('ns-name').value='';
+      $('ns-name').disabled=false;
+      $('ns-desc').value='';
+      $('ns-ipv4').value='';
+      $('ns-ipv6').value='';
+      $('ns-gw').value='';
+      $('ns-gw6').value='';
+      populatePortSelect('');
+      renderNsRoutes([]);
+    }
+  });
+}
+
+function hideNsForm(){$('ns-form').style.display='none';}
+
+let nsTempRoutes=[];
+function addNsRoute(prefix,nextHop){
+  nsTempRoutes.push({prefix:prefix||'',next_hop:nextHop||''});
+  renderNsRoutes(nsTempRoutes);
+}
+function removeNsRoute(idx){nsTempRoutes.splice(idx,1);renderNsRoutes(nsTempRoutes);}
+
+function renderNsRoutes(routes){
+  nsTempRoutes=routes;
+  const div=$('ns-routes-list');
+  if(!routes.length){div.innerHTML='<span style=\"font-size:10px;color:#555\">No static routes</span>';return;}
+  let html='';
+  routes.forEach((r,i)=>{
+    html+=`<div class=\"form-row\" style=\"margin:2px 0\">`+
+      `<input value=\"${r.prefix||''}\" onchange=\"nsTempRoutes[${i}].prefix=this.value\" placeholder=\"10.0.0.0/24\" size=\"18\" style=\"font-size:10px\">`+
+      `<input value=\"${r.next_hop||''}\" onchange=\"nsTempRoutes[${i}].next_hop=this.value\" placeholder=\"10.0.0.3\" size=\"15\" style=\"font-size:10px\">`+
+      `<button class=\"small danger\" onclick=\"removeNsRoute(${i})\">✕</button>`+
+    `</div>`;
+  });
+  div.innerHTML=html;
+}
+
+async function saveNamespace(){
+  const mode=$('ns-edit-mode').value;
+  const name=$('ns-name').value.trim();
+  if(!name){alert('Name required');return;}
+  const payload={
+    name:name,description:$('ns-desc').value.trim(),
+    interface:$('ns-iface').value,
+    ipv4:$('ns-ipv4').value.trim(),ipv6:$('ns-ipv6').value.trim(),
+    gateway:$('ns-gw').value.trim(),gateway6:$('ns-gw6').value.trim(),
+    static_routes:nsTempRoutes.map(r=>({prefix:r.prefix.trim(),next_hop:r.next_hop.trim()})).filter(r=>r.prefix&&r.next_hop)
+  };
+  const method=mode==='edit'?'PUT':'POST';
+  const url=mode==='edit'?API+'/api/namespaces/'+encodeURIComponent(name):API+'/api/namespaces';
+  try{
+    const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(d.success){hideNsForm();loadNamespaces();}
+    else{alert('Error: '+(d.error||'Unknown'));}
+  }catch(e){alert('Error: '+e);}
+}
+
+async function deleteNamespace(name){
+  if(!confirm('Delete namespace '+name+'?'))return;
+  try{await fetch(API+'/api/namespaces/'+encodeURIComponent(name),{method:'DELETE'});loadNamespaces();}catch(e){}
 }
 
 async function addStream(){

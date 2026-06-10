@@ -1,0 +1,24 @@
+{
+  "iperf_ns2": {
+    "description": "171-Eth513 (Port 0)",
+    "interface": "enp8s0np0",
+    "ipv4": "10.0.0.2/31",
+    "ipv6": "2001:db8:513::2/64",
+    "gateway": "10.0.0.3",
+    "gateway6": "2001:db8:513::1",
+    "static_routes": [
+      {"prefix": "192.168.100.0/24", "next_hop": "10.0.0.3"}
+    ]
+  },
+  "iperf_ns": {
+    "description": "172-Eth513 (Port 1)",
+    "interface": "enp11s0np1",
+    "ipv4": "10.20.0.0/31",
+    "ipv6": "2001:db8:514::2/64",
+    "gateway": "10.20.0.1",
+    "gateway6": "2001:db8:514::1",
+    "static_routes": [
+      {"prefix": "192.168.100.0/24", "next_hop": "10.20.0.1"}
+    ]
+  }
+}
