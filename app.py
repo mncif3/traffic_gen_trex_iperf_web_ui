@@ -1025,13 +1025,41 @@ def api_delete_host(name):
 
 # ═══════════════════ TRex Port Info ═══════════════════
 
+def _get_ns_iface_status(ns, iface):
+    try:
+        r = subprocess.run(['sudo', 'ip', 'netns', 'exec', ns, 'ip', '-j', 'addr', 'show', iface],
+                          capture_output=True, text=True, timeout=5)
+        if r.returncode != 0: return None
+        info = json.loads(r.stdout)
+        if not info: return None
+        addr_info = info[0]
+        ips = [a['local'] for a in addr_info.get('addr_info',[]) if a.get('family')=='inet']
+        ips6 = [a['local'] for a in addr_info.get('addr_info',[]) if a.get('family')=='inet6' and not a['local'].startswith('fe80')]
+        mac = addr_info.get('address', '-')
+        link = 'UP' if 'UP' in addr_info.get('flags',[]) else 'DOWN'
+        return {'ip': ips[0] if ips else '-', 'ip6': ips6[0] if ips6 else '-', 'mac': mac, 'link': link}
+    except: return None
+
 @app.route('/api/ports')
 def api_ports():
     host = request.args.get('host', 'local')
     try:
         c = get_trex_client(host)
         if not c:
-            return jsonify({'success': False, 'error': f'Host {host} not connected'}), 500
+            # TRex not running - show namespace interface status
+            p0 = _get_ns_iface_status('iperf_ns2', 'enp8s0np0')
+            p1 = _get_ns_iface_status('iperf_ns', 'enp11s0np1')
+            ports = [
+                {'port': 0, 'link': p0['link'] if p0 else 'DOWN', 'speed': 10,
+                 'src_ip': p0['ip'] if p0 else '-', 'src_ip6': p0['ip6'] if p0 else '-',
+                 'dest': '171 Eth513', 'src_mac': p0['mac'] if p0 else '-',
+                 'status': 'iperf mode', 'pci': '08:00.0'},
+                {'port': 1, 'link': p1['link'] if p1 else 'DOWN', 'speed': 10,
+                 'src_ip': p1['ip'] if p1 else '-', 'src_ip6': p1['ip6'] if p1 else '-',
+                 'dest': '172 Eth513', 'src_mac': p1['mac'] if p1 else '-',
+                 'status': 'iperf mode', 'pci': '0b:00.0'}
+            ]
+            return jsonify({'success': True, 'ports': ports, 'host': host, 'trex': False})
         ports = []
         for p in [0, 1]:
             info = c.get_port_info(p)
@@ -1043,7 +1071,7 @@ def api_ports():
                 'src_mac': d.get('src_mac', ''), 'status': d.get('status', 'UNKNOWN'),
                 'pci': d.get('pci_addr', '')
             })
-        return jsonify({'success': True, 'ports': ports, 'host': host})
+        return jsonify({'success': True, 'ports': ports, 'host': host, 'trex': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 

@@ -787,10 +787,12 @@ async function loadPorts(){
   try{
     const r=await fetch(API+'/api/ports?host=local');
     const d=await r.json();
-    $('port-status').innerHTML=d.ports?d.ports.map(p=>
-      `<div style="background:#0f1119;border:1px solid #2a2d3a;border-radius:4px;padding:6px;margin-bottom:4px">
-        <b>PORT ${p.port}</b> <span class="val ${p.link==='UP'?'green':'red'}">${p.link} @ ${p.speed}G</span><br>
-        <span style="font-size:9px;color:#888">${p.src_ip||'-'} → ${p.dest||'-'} | MAC:${p.src_mac||'-'} | ${p.status}</span>
+    $('port-status').innerHTML=d.ports?d.ports.map(p=>{
+      const mode=p.status==='iperf mode'?'<span style="color:#4f8cff;font-size:10px">[iperf]</span>':'';
+      const v6=p.src_ip6?`<br><span style="font-size:9px;color:#666">v6:${p.src_ip6}</span>`:'';
+      return `<div style="background:#0f1119;border:1px solid #2a2d3a;border-radius:4px;padding:6px;margin-bottom:4px">
+        <b>PORT ${p.port}</b> <span class="val ${p.link==='UP'?'green':'red'}">${p.link} @ ${p.speed}G</span> ${mode}<br>
+        <span style="font-size:9px;color:#888">v4:${p.src_ip||'-'} → ${p.dest||'-'} | MAC:${p.src_mac||'-'}</span>${v6}</div>`}).join('')
       </div>`).join(''):'Error';
   }catch(e){}
 }
