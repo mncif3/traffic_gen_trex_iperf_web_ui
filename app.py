@@ -16,15 +16,16 @@ warnings.filterwarnings('ignore')
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
 # ─── Global State ───
-bgp_process = None
 bgp_running = False
 bgp_local_config = {'local_as': 65000, 'router_id': '192.168.100.174'}
-bgp_neighbors = {}  # {ip: {asn, description, active, state, prefixes_v4, prefixes_v6, advertised_v4, advertised_v6}}
+bgp_neighbors = {}  # {ip: {asn, description, active, state, learned_v4, learned_v6, advertised_v4, advertised_v6, af_types}}
 
-EXABGP_LOG = '/tmp/exabgp_run.log'
-EXABGP_CONF = '/tmp/exabgp_api.conf'
-EXABGP_BIN = '/home/cunshen/.local/bin/exabgp'
-EXABGP_CLI = '/home/cunshen/.local/bin/exabgp-cli'
+# BGP is driven by BIRD 2.x (native TRex integration). BIRD peers with 171/172 over
+# the management network and is independent of the TRex/iPerf3 data-port mode.
+BIRD_BIN  = '/usr/sbin/bird'
+BIRDC     = '/usr/sbin/birdc'
+BIRD_CONF = '/etc/bird/bird.conf'
+BIRD_SOCK = '/run/bird/bird.ctl'
 
 # TRex hosts
 trex_hosts = {
@@ -35,50 +36,40 @@ current_streams = {}
 # ═══════════════════ iPerf3 State ═══════════════════
 iperf_streams = {}  # {id: {protocol, bind_ip, bind_dev, target_ip, port, ...}}
 iperf_next_id = 1
-IPERF_NAMESPACES = ['iperf_ns2', 'iperf_ns']  # iperf_ns2->10G P0->sw171 Eth513, iperf_ns->10G P1->sw172 Eth513
+
+IPERF_NAMESPACES = ['iperf_ns2', 'iperf_ns']  # iperf_ns2 -> sw171 Eth513, iperf_ns -> sw172 Eth513
 
 def _get_interfaces():
-    """Get the iperf-namespace IPs that populate the "Src IP" dropdown.
+    """List IPs configured inside the iPerf3/TRex namespaces (Src IP dropdown options).
 
-    Bug 1 fix: the 10G data ports used for iperf live INSIDE the namespaces
-    (iperf_ns2 -> 10G Port 0 -> switch 171 Eth513,
-     iperf_ns  -> 10G Port 1 -> switch 172 Eth513). Their IPs are not visible
-    in the container's default namespace, so the previous default-namespace
-    scan always returned [] and the dropdown was empty. Enumerate each
-    namespace explicitly with `ip netns exec <ns> ip -j addr`, mirroring how
-    the working QoS path runs iperf inside the namespaces.
-
-    Returns e.g.:
-      [{"name": "iperf_ns2", "ipv4": ["10.0.0.2"], "ipv6": []},
-       {"name": "iperf_ns",  "ipv4": ["10.0.0.0"], "ipv6": []}]
+    Bug 1 fix: the data-plane IPs live inside the network namespaces, not in the
+    container's default namespace, so we must enumerate each namespace explicitly.
+    Returns e.g. [{"name":"iperf_ns2","ipv4":["10.0.0.2"],"ipv6":[]}, ...].
     """
     import json as _json
     interfaces = []
     for ns in IPERF_NAMESPACES:
-        ipv4_list, ipv6_list = [], []
         try:
             result = subprocess.run(
-                ['sudo', 'ip', 'netns', 'exec', ns, 'ip', '-j', 'addr', 'show'],
+                ['sudo', 'ip', 'netns', 'exec', ns, 'ip', '-j', 'addr'],
                 capture_output=True, text=True, timeout=5)
-            if result.returncode != 0:
-                print(f'[iperf] ns {ns} addr enum rc={result.returncode}: '
-                      f'{result.stderr.strip()}', flush=True)
+            if result.returncode != 0 or not result.stdout.strip():
                 continue
-            for iface in _json.loads(result.stdout or '[]'):
+            ipv4_list, ipv6_list = [], []
+            for iface in _json.loads(result.stdout):
                 for a in iface.get('addr_info', []):
-                    ip = a.get('local', '')
-                    if not ip or ip.startswith('127.'):
-                        continue
+                    addr = a.get('local', '')
                     if a.get('family') == 'inet':
-                        # exclude the management subnet
-                        if not ip.startswith('192.168.100.'):
-                            ipv4_list.append(ip)
+                        # skip loopback and the management subnet
+                        if addr.startswith('127.') or addr.startswith('192.168.100.'):
+                            continue
+                        ipv4_list.append(addr)
                     elif a.get('family') == 'inet6' and a.get('scope') == 'global':
-                        ipv6_list.append(ip)
-        except Exception as e:
-            print(f'[iperf] interface enum error in {ns}: {e}', flush=True)
-        if ipv4_list or ipv6_list:
-            interfaces.append({'name': ns, 'ipv4': ipv4_list, 'ipv6': ipv6_list})
+                        ipv6_list.append(addr)
+            if ipv4_list or ipv6_list:
+                interfaces.append({'name': ns, 'ipv4': ipv4_list, 'ipv6': ipv6_list})
+        except Exception:
+            continue
     return interfaces
 
 def _parse_iperf_json(output):
@@ -146,16 +137,11 @@ def _build_iperf_cmd(stream, role='client'):
     """Build iperf3 command line for a stream."""
     cmd = ['iperf3']
     if role == 'server':
-        # Bug 2 fix: do NOT bind the server with -B <target_ip>.
-        # The proven-working QoS path (/api/qos/run) starts the server as
-        #   sudo ip netns exec iperf_ns iperf3 -s -1 --port N
-        # i.e. it listens on ALL addresses inside iperf_ns and never binds.
-        # Binding with -B <ip> makes iperf3 fail with
-        #   "unable to start listener ... Cannot assign requested address"
-        # and exit code 1 whenever that IP is not configured in the namespace,
-        # which is exactly the "Server failed to start" / "Server exited code 1"
-        # symptom. The client still connects to target_ip explicitly, so an
-        # unbound server in the namespace is correct.
+        # Bug 2 fix: do NOT bind the server to a specific address. Binding with
+        # `-B <ip>` makes iperf3 -s exit 1 when that IP is not assignable in the
+        # namespace. Listen on all addresses in the namespace, matching the proven
+        # /api/qos/run path (iperf3 -s -D -1 --port N). The client still targets the
+        # server IP explicitly via -c.
         cmd += ['-s', '-1']
         if stream.get('port'):
             cmd += ['-p', str(stream['port'])]
@@ -428,17 +414,13 @@ def iperf_start(sid):
     cmd = _build_iperf_cmd(stream, 'server')
     print(f'[iperf] Starting server: {" ".join(cmd)}', flush=True)
     try:
-        proc = subprocess.Popen(["sudo", "ip", "netns", "exec", "iperf_ns"] + cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(["sudo", "ip", "netns", "exec", "iperf_ns"] + cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.5)
         if proc.poll() is not None:
-            try:
-                err = (proc.stderr.read() or '').strip()
-            except Exception:
-                err = ''
             stream['server_running'] = False
-            stream['last_result'] = {'error': f'Server exited code {proc.returncode}: {err}'}
-            print(f'[iperf] Server exited immediately (code {proc.returncode}): {err}', flush=True)
-            return jsonify({'success': False, 'error': f'Server failed to start: {err}'})
+            stream['last_result'] = {'error': f'Server exited code {proc.returncode}'}
+            print(f'[iperf] Server exited immediately (code {proc.returncode})', flush=True)
+            return jsonify({'success': False, 'error': 'Server failed to start'})
         stream['server_process'] = proc
         stream['server_running'] = True
         print(f'[iperf] Server PID {proc.pid} running on port {port}', flush=True)
@@ -582,240 +564,228 @@ def pps_to_bandwidth(pps, pkt_size=64):
     overhead = 20
     return round((pps * (pkt_size + overhead) * 8) / 1e6, 2)
 
-# ═══════════════════ BGP: Multi-Neighbor Log Parser ═══════════════════
+# ═══════════════════ BGP: BIRD Control ═══════════════════
+# BIRD 2.x replaces ExaBGP. The HTTP API contract is unchanged so the frontend
+# (index.html) needs no edits. Per-neighbor advertised prefixes are rendered as
+# per-neighbor `static` protocols and exported only to that peer.
 
-RE_PEER_OUTGOING = re.compile(r'outgoing-(\d+)\s+attempting connection to (\S+):179')
-RE_PEER_OPEN = re.compile(r'(?:peer|outgoing)-(\d+)\s+<< OPEN version=\d+ asn=(\d+)')
-RE_PEER_EOR_ALL = re.compile(r'peer-(\d+)\s+>> all EOR')
-RE_PEER_UPDATE_NLRI_IP = re.compile(
-    r'peer-(\d+)\s+UPDATE #\d+\s+nlri\s+\(\s*\d+\)\s+'
-    r'([0-9a-fA-F:./]+)\s+next-hop\s+(\S+)'
-)
-RE_PEER_UPDATE_EOR = re.compile(r'peer-(\d+)\s+UPDATE #\d+\s+nlri.*eor\s')
-RE_PEER_KEEPALIVE = re.compile(r'peer-(\d+).*KEEPALIVE')
-
-def _parse_exabgp_log():
-    """Parse ExaBGP log for multi-neighbor state and per-peer routes.
-
-    Returns:
-        result: {ip: {state, asn, prefixes_v4, prefixes_v6}}
-    """
-    known_ips = set()  # all IPs seen in outgoing connections
-    peer_asn = {}  # {ip: asn} from OPEN messages
-    peer_state = {}  # {ip: state}
-    peer_routes_v4 = {}  # {ip: [{prefix, next_hop}]}
-    peer_routes_v6 = {}
-
+def _birdc(*args):
+    """Run a birdc command against the BIRD control socket. Returns (ok, output)."""
     try:
-        with open(EXABGP_LOG) as f:
-            content = f.read()
-    except:
-        content = ''
+        r = subprocess.run([BIRDC, '-s', BIRD_SOCK] + list(args),
+                           capture_output=True, text=True, timeout=8)
+        return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+    except Exception as e:
+        return False, str(e)
 
-    lines = content.splitlines()
+def _proto_name(ip):
+    """Stable BIRD protocol name for a neighbor IP (BIRD allows [A-Za-z0-9_])."""
+    return 'peer_' + re.sub(r'[^0-9a-zA-Z]', '_', ip)
 
-    for line in lines:
-        # Detect all peer IPs from outgoing connections
-        m = RE_PEER_OUTGOING.search(line)
-        if m:
-            ip = m.group(2)
-            known_ips.add(ip)
-            if ip not in peer_state:
-                peer_state[ip] = 'connecting'
-
-        # OPEN → get ASN and set established
-        m = RE_PEER_OPEN.search(line)
-        if m:
-            asn = int(m.group(2))
-            # Try to find which IP this OPEN corresponds to
-            # We need to match: the IP before this OPEN that's still 'connecting'
-            for ip in known_ips:
-                if peer_state.get(ip) in ('connecting', None, ''):
-                    peer_asn.setdefault(ip, asn)
-                    peer_state[ip] = 'established'
-                    break
-
-        # All EOR sent → fully up
-        m = RE_PEER_EOR_ALL.search(line)
-        if m:
-            # mark all established as up
-            for ip in known_ips:
-                if peer_state.get(ip) == 'established':
-                    peer_state[ip] = 'up'
-
-        # EOR in update → skip
-        if RE_PEER_UPDATE_EOR.search(line):
-            continue
-
-        # NLRI routes
-        m = RE_PEER_UPDATE_NLRI_IP.search(line)
-        if m:
-            prefix = m.group(2)
-            next_hop = m.group(3)
-            is_v6 = ':' in prefix
-
-            # Assign to the appropriate peer based on next-hop or AF
-            assigned = False
-            for ip in known_ips:
-                if (':' in next_hop and ':' in ip) or (':' not in next_hop and ':' not in ip):
-                    if is_v6:
-                        peer_routes_v6.setdefault(ip, []).append({'prefix': prefix, 'next_hop': next_hop})
-                    else:
-                        peer_routes_v4.setdefault(ip, []).append({'prefix': prefix, 'next_hop': next_hop})
-                    assigned = True
-                    break
-            if not assigned and known_ips:
-                # Fallback: assign to first known IP
-                ip = next(iter(known_ips))
-                if is_v6:
-                    peer_routes_v6.setdefault(ip, []).append({'prefix': prefix, 'next_hop': next_hop})
-                else:
-                    peer_routes_v4.setdefault(ip, []).append({'prefix': prefix, 'next_hop': next_hop})
-
-    # Deduplicate routes per peer
-    for routes_dict in (peer_routes_v4, peer_routes_v6):
-        for pn in list(routes_dict.keys()):
-            seen = set()
-            deduped = []
-            for r in routes_dict[pn]:
-                if r['prefix'] not in seen:
-                    seen.add(r['prefix'])
-                    deduped.append(r)
-            routes_dict[pn] = deduped
-
-    # Build result keyed by IP
-    result = {}
-    for ip, nbr in bgp_neighbors.items():
-        state = peer_state.get(ip, nbr.get('state', 'unknown'))
-        result[ip] = {
-            'state': state,
-            'asn': peer_asn.get(ip, nbr.get('asn', 0)),
-            'prefixes_v4': peer_routes_v4.get(ip, []),
-            'prefixes_v6': peer_routes_v6.get(ip, []),
-        }
-
-    # Also detect any new peers from log that aren't in our config
-    for ip in known_ips:
-        if ip not in result:
-            result[ip] = {
-                'state': peer_state.get(ip, 'up'),
-                'asn': peer_asn.get(ip, 0),
-                'prefixes_v4': peer_routes_v4.get(ip, []),
-                'prefixes_v6': peer_routes_v6.get(ip, []),
-            }
-
-    return result
-
-# ═══════════════════ BGP: Config Builder ═══════════════════
+def _bird_state_to_status(bird_info):
+    s = (bird_info or '').lower()
+    if 'establ' in s:
+        return 'established'
+    if any(k in s for k in ('active', 'connect', 'opensent', 'openconfirm')):
+        return 'connecting'
+    if 'idle' in s:
+        return 'idle'
+    return s.strip() or 'unknown'
 
 def _get_local_ipv6():
     """Find a global unicast IPv6 address on this host."""
     try:
-        result = subprocess.run(['ip', '-6', 'addr', 'show', 'scope', 'global'],
-                                capture_output=True, text=True, timeout=3)
-        for line in result.stdout.splitlines():
+        r = subprocess.run(['ip', '-6', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=3)
+        for line in r.stdout.splitlines():
             m = re.search(r'inet6\s+([0-9a-f:]+)/\d+', line)
             if m and not m.group(1).startswith('fe80'):
                 return m.group(1)
-    except:
+    except Exception:
         pass
     return '::1'
 
-def _build_exabgp_config():
-    """Build ExaBGP config file from active neighbors."""
-    config = []
+# ── Config builder ──
+
+def _build_bird_config():
+    """Render bird.conf from bgp_local_config + bgp_neighbors. Returns active count."""
+    rid = bgp_local_config['router_id']
+    local_as = bgp_local_config['local_as']
+    local6 = None
+    lines = [
+        '# Auto-generated by trex-web. Do not edit by hand.',
+        'log syslog all;',
+        f'router id {rid};',
+        '',
+        'protocol device { }',
+        '',
+    ]
+    active = 0
     for ip, nbr in bgp_neighbors.items():
         if not nbr.get('active', True):
-            continue  # skip stopped neighbors
-
+            continue
+        active += 1
+        pname = _proto_name(ip)
         is_v6 = ':' in ip
-        local_addr = bgp_local_config['router_id']
-        if is_v6:
-            local_addr = _get_local_ipv6()
+        if is_v6 and local6 is None:
+            local6 = _get_local_ipv6()
+        local_addr = local6 if is_v6 else rid
 
-        # Determine AF: if IPv6 peer, prefer ipv6; if IPv4, prefer both
-        af_list = nbr.get('af_types', [])
-        if not af_list:
-            af_list = ['ipv4 unicast', 'ipv6 unicast'] if not is_v6 else ['ipv6 unicast', 'ipv4 unicast']
+        adv4 = nbr.get('advertised_v4', [])
+        adv6 = nbr.get('advertised_v6', [])
+        if adv4:
+            lines.append(f'protocol static static4_{pname} {{')
+            lines.append('    ipv4;')
+            for pfx in adv4:
+                lines.append(f'    route {pfx} blackhole;')
+            lines.append('}')
+            lines.append('')
+        if adv6:
+            lines.append(f'protocol static static6_{pname} {{')
+            lines.append('    ipv6;')
+            for pfx in adv6:
+                lines.append(f'    route {pfx} blackhole;')
+            lines.append('}')
+            lines.append('')
 
-        families = ';\n    '.join(af_list) + ';'
+        af_list = nbr.get('af_types', ['ipv4 unicast', 'ipv6 unicast'])
+        want4 = any('ipv4' in a for a in af_list)
+        want6 = any('ipv6' in a for a in af_list)
 
-        config.append(f"""neighbor {ip} {{
-    router-id {bgp_local_config['router_id']};
-    local-as {bgp_local_config['local_as']};
-    local-address {local_addr};
-    peer-as {nbr['asn']};
-    hold-time 30;
-    family {{
-    {families}
-    }}
-}}""")
+        lines.append(f'protocol bgp {pname} {{')
+        lines.append(f'    local {local_addr} as {local_as};')
+        lines.append(f'    neighbor {ip} as {nbr["asn"]};')
+        lines.append('    hold time 30;')
+        if want4:
+            exp4 = f'export where proto = "static4_{pname}";' if adv4 else 'export none;'
+            lines.append('    ipv4 {')
+            lines.append('        import all;')
+            lines.append(f'        {exp4}')
+            lines.append('        next hop self;')
+            lines.append('    };')
+        if want6:
+            exp6 = f'export where proto = "static6_{pname}";' if adv6 else 'export none;'
+            lines.append('    ipv6 {')
+            lines.append('        import all;')
+            lines.append(f'        {exp6}')
+            lines.append('        next hop self;')
+            lines.append('    };')
+        lines.append('}')
+        lines.append('')
 
-    with open(EXABGP_CONF, 'w') as f:
-        f.write('\n'.join(config))
+    os.makedirs(os.path.dirname(BIRD_CONF), exist_ok=True)
+    with open(BIRD_CONF, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    return active
 
-    return config
+# ── Daemon lifecycle ──
 
-def _start_exabgp():
-    """Start or restart ExaBGP process."""
-    global bgp_process, bgp_running
-
-    # Build config
-    config = _build_exabgp_config()
-    if not config:
-        return False, "No active neighbors to start"
-
-    # Kill existing process if running
-    _stop_exabgp()
-    time.sleep(1)
-
+def _bird_daemon_running():
     try:
-        # Use shell redirect for reliable log output
-        cmd = f"cd /home/cunshen && {EXABGP_BIN} {EXABGP_CONF} --debug > {EXABGP_LOG} 2>&1"
-        bgp_process = subprocess.Popen(
-            cmd, shell=True, cwd='/home/cunshen', preexec_fn=os.setsid
-        )
-        time.sleep(4)
-        # ExaBGP daemonizes: parent exits, child keeps running
-        # Check pgrep to confirm the daemon is alive
-        try:
-            result = subprocess.run(['pgrep', '-f', 'exabgp'],
-                                    capture_output=True, text=True, timeout=3)
-            if result.stdout.strip():
-                bgp_running = True
-                return True, "BGP started"
-        except:
-            pass
+        r = subprocess.run(['pgrep', '-x', 'bird'], capture_output=True, text=True, timeout=3)
+        return bool(r.stdout.strip())
+    except Exception:
+        return False
 
-        return False, "ExaBGP did not start"
+def _start_bird():
+    """(Re)load BIRD with the current config; start the daemon if needed."""
+    global bgp_running
+    active = _build_bird_config()
+    if active == 0:
+        _stop_bird()
+        return False, "No active neighbors to start"
+    os.makedirs(os.path.dirname(BIRD_SOCK), exist_ok=True)
+    if _bird_daemon_running():
+        ok, out = _birdc('configure')
+        bgp_running = True
+        return (ok, "BGP reconfigured" if ok else out)
+    try:
+        r = subprocess.run([BIRD_BIN, '-c', BIRD_CONF, '-s', BIRD_SOCK],
+                           capture_output=True, text=True, timeout=8)
+        time.sleep(1)
+        if _bird_daemon_running():
+            bgp_running = True
+            return True, "BGP started"
+        bgp_running = False
+        return False, (r.stdout + r.stderr).strip() or "BIRD did not start"
     except Exception as e:
         bgp_running = False
         return False, str(e)
 
-def _stop_exabgp():
-    """Stop ExaBGP process if running."""
-    global bgp_process, bgp_running
-    if bgp_process:
+def _stop_bird():
+    """Stop the BIRD daemon."""
+    global bgp_running
+    ok, _ = _birdc('down')
+    if not ok:
         try:
-            os.killpg(os.getpgid(bgp_process.pid), signal.SIGTERM)
-        except:
-            try:
-                bgp_process.terminate()
-            except:
-                pass
-        bgp_process = None
+            subprocess.run(['pkill', '-x', 'bird'], timeout=5)
+        except Exception:
+            pass
     bgp_running = False
 
 def _check_bgp_running():
-    """Check if ExaBGP is actually running."""
+    """Check if BIRD is actually running."""
     global bgp_running
-    try:
-        result = subprocess.run(['pgrep', '-f', 'exabgp'],
-                                capture_output=True, text=True, timeout=3)
-        bgp_running = bool(result.stdout.strip())
-    except:
-        bgp_running = bgp_process is not None and bgp_process.poll() is None
+    bgp_running = _bird_daemon_running()
     return bgp_running
+
+# ── Live state parsing ──
+
+def _bird_show_protocols():
+    """Return {proto_name: info_string} for BGP protocols from birdc show protocols."""
+    ok, out = _birdc('show', 'protocols')
+    protos = {}
+    if not ok:
+        return protos
+    for line in out.splitlines():
+        toks = line.split()
+        if len(toks) >= 2 and toks[1] == 'BGP':
+            # columns: Name Proto Table State Since [Info...]
+            info = ' '.join(toks[5:]) if len(toks) > 5 else (toks[3] if len(toks) > 3 else '')
+            protos[toks[0]] = info
+    return protos
+
+def _bird_routes_for(pname):
+    """Return (v4, v6) lists of {prefix, next_hop} learned from a BGP protocol."""
+    v4, v6 = [], []
+    ok, out = _birdc('show', 'route', 'protocol', pname, 'all')
+    if not ok:
+        return v4, v6
+    cur = None
+    for line in out.splitlines():
+        m = re.match(r'^([0-9a-fA-F:.]+/\d+)\b', line)
+        if m:
+            cur = m.group(1)
+            nh = ''
+            mvia = re.search(r'via\s+(\S+)', line)
+            if mvia:
+                nh = mvia.group(1)
+            (v6 if ':' in cur else v4).append({'prefix': cur, 'next_hop': nh})
+        else:
+            mvia = re.search(r'via\s+(\S+)', line)
+            if mvia and cur:
+                bucket = v6 if ':' in cur else v4
+                if bucket and not bucket[-1]['next_hop']:
+                    bucket[-1]['next_hop'] = mvia.group(1)
+    return v4, v6
+
+def _parse_bird_live():
+    """Live BGP state keyed by neighbor IP (parallels the legacy exabgp parser)."""
+    protos = _bird_show_protocols()
+    result = {}
+    for ip, nbr in bgp_neighbors.items():
+        pname = _proto_name(ip)
+        state = _bird_state_to_status(protos.get(pname))
+        v4, v6 = ([], [])
+        if state == 'established':
+            v4, v6 = _bird_routes_for(pname)
+        result[ip] = {
+            'state': state if state != 'unknown' else nbr.get('state', 'configured'),
+            'asn': nbr.get('asn', 0),
+            'prefixes_v4': v4,
+            'prefixes_v6': v6,
+        }
+    return result
 
 # ═══════════════════ BGP: API Endpoints ═══════════════════
 
@@ -823,16 +793,12 @@ def _check_bgp_running():
 def bgp_status():
     """Overall BGP status with all neighbors."""
     _check_bgp_running()
+    live_peers = _parse_bird_live()
 
-    # Parse log for live state
-    live_peers = _parse_exabgp_log()
-
-    # Merge live state into our neighbor config
     neighbors = {}
     for ip, nbr in bgp_neighbors.items():
         live = live_peers.get(ip, {})
         state = live.get('state', nbr.get('state', 'configured'))
-        # If BGP not running, mark all as stopped
         if not bgp_running and state not in ('stopped', 'configured'):
             state = 'stopped'
 
@@ -848,42 +814,11 @@ def bgp_status():
             'advertised_v6': nbr.get('advertised_v6', []),
             'af_types': nbr.get('af_types', ['ipv4 unicast', 'ipv6 unicast']),
         }
-
-        # Update learned routes in memory
         if live.get('prefixes_v4'):
             nbr['learned_v4'] = live['prefixes_v4']
         if live.get('prefixes_v6'):
             nbr['learned_v6'] = live['prefixes_v6']
         nbr['state'] = state
-
-    # Also include live peers not in config — and auto-add them to bgp_neighbors
-    for ip, live in live_peers.items():
-        if ip not in neighbors:
-            neighbors[ip] = {
-                'ip': ip,
-                'asn': live.get('asn', 0),
-                'description': '(auto-detected)',
-                'active': True,
-                'state': live.get('state', 'up'),
-                'prefixes_v4': live.get('prefixes_v4', []),
-                'prefixes_v6': live.get('prefixes_v6', []),
-                'advertised_v4': [],
-                'advertised_v6': [],
-                'af_types': ['ipv4 unicast', 'ipv6 unicast'],
-            }
-            # Auto-add to bgp_neighbors so config builder includes it on restart
-            if ip not in bgp_neighbors:
-                bgp_neighbors[ip] = {
-                    'asn': live.get('asn', 0),
-                    'description': '(auto-detected)',
-                    'active': True,
-                    'state': live.get('state', 'up'),
-                    'learned_v4': live.get('prefixes_v4', []),
-                    'learned_v6': live.get('prefixes_v6', []),
-                    'advertised_v4': [],
-                    'advertised_v6': [],
-                    'af_types': ['ipv4 unicast', 'ipv6 unicast'],
-                }
 
     total_v4 = sum(len(n.get('prefixes_v4', [])) for n in neighbors.values())
     total_v6 = sum(len(n.get('prefixes_v6', [])) for n in neighbors.values())
@@ -930,17 +865,20 @@ def bgp_add_neighbor():
         'advertised_v6': [],
         'af_types': af_types,
     }
-
     return jsonify({'success': True, 'message': f'Neighbor {ip} added', 'neighbor': bgp_neighbors[ip]})
 
 @app.route('/api/bgp/neighbors/<path:ip>', methods=['DELETE'])
 def bgp_delete_neighbor(ip):
     global bgp_neighbors
-    ip = ip.replace('_', ':')  # allow URL-safe encoding
+    ip = ip.replace('_', ':')
     if ip not in bgp_neighbors:
         return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
-
     del bgp_neighbors[ip]
+    # Re-render config so the peer is removed from BIRD too
+    if any(v.get('active', True) for v in bgp_neighbors.values()):
+        _start_bird()
+    else:
+        _stop_bird()
     return jsonify({'success': True, 'message': f'Neighbor {ip} removed'})
 
 @app.route('/api/bgp/neighbors/<path:ip>/start', methods=['POST'])
@@ -948,35 +886,27 @@ def bgp_start_neighbor(ip):
     ip = ip.replace('_', ':')
     if ip not in bgp_neighbors:
         return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
-
     bgp_neighbors[ip]['active'] = True
     bgp_neighbors[ip]['state'] = 'starting'
-
-    # Restart ExaBGP with updated config
-    ok, msg = _start_exabgp()
+    ok, msg = _start_bird()
     if ok:
         bgp_neighbors[ip]['state'] = 'connecting'
         return jsonify({'success': True, 'message': f'Neighbor {ip} started'})
-    else:
-        bgp_neighbors[ip]['state'] = 'error'
-        return jsonify({'success': False, 'error': msg}), 500
+    bgp_neighbors[ip]['state'] = 'error'
+    return jsonify({'success': False, 'error': msg}), 500
 
 @app.route('/api/bgp/neighbors/<path:ip>/stop', methods=['POST'])
 def bgp_stop_neighbor(ip):
     ip = ip.replace('_', ':')
     if ip not in bgp_neighbors:
         return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
-
     bgp_neighbors[ip]['active'] = False
     bgp_neighbors[ip]['state'] = 'stopped'
-
-    # Check if any active neighbors remain
     active_neighbors = [k for k, v in bgp_neighbors.items() if v.get('active', True)]
     if active_neighbors:
-        _start_exabgp()  # restart without this neighbor
+        _start_bird()  # reconfigure without this neighbor
     else:
-        _stop_exabgp()
-
+        _stop_bird()
     return jsonify({'success': True, 'message': f'Neighbor {ip} stopped'})
 
 # ─── Per-Neighbor Routes ───
@@ -984,7 +914,7 @@ def bgp_stop_neighbor(ip):
 @app.route('/api/bgp/neighbors/<path:ip>/routes')
 def bgp_neighbor_routes(ip):
     ip = ip.replace('_', ':')
-    live = _parse_exabgp_log()
+    live = _parse_bird_live()
     nbr = bgp_neighbors.get(ip)
     live_info = live.get(ip, {})
 
@@ -1003,64 +933,43 @@ def bgp_neighbor_routes(ip):
 @app.route('/api/bgp/neighbors/<path:ip>/advertise', methods=['POST'])
 def bgp_advertise_route(ip):
     ip = ip.replace('_', ':')
-    data = request.json
+    data = request.json or {}
     prefix = data.get('prefix', '').strip()
-    next_hop = data.get('next_hop', bgp_local_config['router_id'])
-
     if not prefix:
         return jsonify({'success': False, 'error': 'Prefix required'}), 400
+    if ip not in bgp_neighbors:
+        return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
 
-    af = 'ipv6' if ':' in prefix else 'ipv4'
-    if af == 'ipv6' and not (':' in str(next_hop)):
-        next_hop = _get_local_ipv6()
+    key = 'advertised_v6' if ':' in prefix else 'advertised_v4'
+    if prefix not in bgp_neighbors[ip].setdefault(key, []):
+        bgp_neighbors[ip][key].append(prefix)
 
-    # Use text command format for exabgp-cli
-    cmd = f"neighbor {ip} announce route {prefix} next-hop {next_hop}\n"
-
-    try:
-        result = subprocess.run(
-            [EXABGP_CLI, '--pipename', '/home/cunshen/.local/run/exabgp'],
-            input=cmd, text=True, timeout=5, capture_output=True
-        )
-        # Track advertised route in memory
-        if ip in bgp_neighbors:
-            key = f'advertised_{"v6" if af == "ipv6" else "v4"}'
-            if prefix not in bgp_neighbors[ip].setdefault(key, []):
-                bgp_neighbors[ip][key].append(prefix)
-
-        return jsonify({'success': True, 'message': f'Advertised {prefix} to {ip}',
-                        'output': result.stdout[:200] + result.stderr[:200]})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+    ok, msg = _start_bird()  # rebuild config + birdc configure
+    if not ok:
+        # roll back the in-memory change on failure
+        if prefix in bgp_neighbors[ip].get(key, []):
+            bgp_neighbors[ip][key].remove(prefix)
+        return jsonify({'success': False, 'error': msg}), 500
+    return jsonify({'success': True, 'message': f'Advertised {prefix} to {ip}'})
 
 @app.route('/api/bgp/neighbors/<path:ip>/withdraw', methods=['POST'])
 def bgp_withdraw_route(ip):
     ip = ip.replace('_', ':')
-    data = request.json
+    data = request.json or {}
     prefix = data.get('prefix', '').strip()
-
     if not prefix:
         return jsonify({'success': False, 'error': 'Prefix required'}), 400
+    if ip not in bgp_neighbors:
+        return jsonify({'success': False, 'error': 'Neighbor not found'}), 404
 
-    cmd = f"neighbor {ip} withdraw route {prefix}\n"
+    key = 'advertised_v6' if ':' in prefix else 'advertised_v4'
+    if prefix in bgp_neighbors[ip].get(key, []):
+        bgp_neighbors[ip][key].remove(prefix)
 
-    try:
-        result = subprocess.run(
-            [EXABGP_CLI, '--pipename', '/home/cunshen/.local/run/exabgp'],
-            input=cmd, text=True, timeout=5, capture_output=True
-        )
-
-        # Remove from tracked advertised routes
-        if ip in bgp_neighbors:
-            af = 'ipv6' if ':' in prefix else 'ipv4'
-            key = f'advertised_v{6 if af == "ipv6" else 4}'
-            if prefix in bgp_neighbors[ip].get(key, []):
-                bgp_neighbors[ip][key].remove(prefix)
-
-        return jsonify({'success': True, 'message': f'Withdrawn {prefix} from {ip}',
-                        'output': result.stdout[:200] + result.stderr[:200]})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+    ok, msg = _start_bird()
+    if not ok:
+        return jsonify({'success': False, 'error': msg}), 500
+    return jsonify({'success': True, 'message': f'Withdrawn {prefix} from {ip}'})
 
 # ─── Global Routes (for Traffic tab) ───
 
@@ -1068,24 +977,18 @@ def bgp_withdraw_route(ip):
 def bgp_all_routes():
     """Return all BGP-learned routes (IPv4+IPv6) for traffic stream selection."""
     routes = []
-    live = _parse_exabgp_log()
-
+    live = _parse_bird_live()
     for ip, info in live.items():
         for r in info.get('prefixes_v4', []):
             prefix = r if isinstance(r, str) else r.get('prefix', '')
-            routes.append({
-                'prefix': prefix,
-                'next_hop': r.get('next_hop', '') if isinstance(r, dict) else '',
-                'af': 'ipv4', 'peer': ip
-            })
+            routes.append({'prefix': prefix,
+                           'next_hop': r.get('next_hop', '') if isinstance(r, dict) else '',
+                           'af': 'ipv4', 'peer': ip})
         for r in info.get('prefixes_v6', []):
             prefix = r if isinstance(r, str) else r.get('prefix', '')
-            routes.append({
-                'prefix': prefix,
-                'next_hop': r.get('next_hop', '') if isinstance(r, dict) else '',
-                'af': 'ipv6', 'peer': ip
-            })
-
+            routes.append({'prefix': prefix,
+                           'next_hop': r.get('next_hop', '') if isinstance(r, dict) else '',
+                           'af': 'ipv6', 'peer': ip})
     return jsonify({'success': True, 'routes': routes})
 
 # ═══════════════════ TRex Host Management ═══════════════════
@@ -1349,7 +1252,7 @@ def api_init():
         'bgp_neighbors': {},
         'trex_ok': False,
     }
-    live = _parse_exabgp_log()
+    live = _parse_bird_live()
     for ip, nbr in bgp_neighbors.items():
         live_info = live.get(ip, {})
         result['bgp_neighbors'][ip] = {

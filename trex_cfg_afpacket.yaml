@@ -1,0 +1,30 @@
+################################################################################
+# trex_cfg_afpacket.yaml — TRex running over the KERNEL i40e ports via af_packet
+#
+# This lets TRex reuse the SAME physical 10G ports as iPerf3 WITHOUT binding them
+# to vfio-pci/DPDK. The ports stay on i40e and live inside the trex_ns namespace,
+# so traffic only ever leaves the data ports (never the management port).
+#
+# Launch (after `sudo netns-mode.sh trex`):
+#   sudo ip netns exec trex_ns /opt/trex/t-rex-64 -i --cfg /etc/trex_cfg_afpacket.yaml
+#
+# NOTE: af_packet is a software path. Expect a few Gbps, NOT 10G line rate.
+#       For line-rate DPDK you would need vfio-pci (which is mutually exclusive
+#       with the namespace/iPerf3 model — that is the trade-off we accepted).
+################################################################################
+- version: 2
+  interfaces: ['enp8s0np0', 'enp11s0np1']   # Port 0 -> 171, Port 3 -> 172 (af_packet by name)
+  port_info:
+    - ip: 10.0.0.0
+      default_gw: 10.0.0.1                   # switch 171 Eth513 side
+    - ip: 10.0.0.2
+      default_gw: 10.0.0.3                   # switch 172 Eth513 side
+  port_limit: 2
+  # Software/af_packet mode: keep core count modest; no hugepage/DPDK NIC binding.
+  c: 2
+  platform:
+    master_thread_id: 0
+    latency_thread_id: 1
+    dual_if:
+      - socket: 0
+        threads: [2, 3]
