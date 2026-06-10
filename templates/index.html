@@ -201,16 +201,23 @@ hr{border:none;border-top:1px solid #2a2d3a;margin:8px 0}
   <div class="panel" style="margin:0 8px 8px">
     <h2>📝 Create Stream Block</h2>
 
-    <!-- BGP route selector -->
+    <!-- BGP route selectors -->
     <div class="form-row" style="margin-bottom:8px">
       <label>Source</label>
       <select id="route-source" onchange="onRouteSourceChange()">
         <option value="manual">Manual IP Entry</option>
-        <option value="bgp">From BGP Route Table</option>
+        <option value="bgp">From NS + BGP</option>
       </select>
-      <span id="bgp-route-picker" style="display:none">
-        <select id="bgp-route-sel" onchange="onBgpRouteSelect()"><option>-- Select a learned route --</option></select>
-      </span>
+    </div>
+    <div id="bgp-route-picker" style="display:none;margin-bottom:8px">
+      <div class="form-row">
+        <label>Src IP</label>
+        <select id="bgp-src-sel" onchange="onBgpSrcSelect()" style="width:200px"><option value="">-- Select source (NS IP / advertised route) --</option></select>
+      </div>
+      <div class="form-row">
+        <label>Dst IP</label>
+        <select id="bgp-dst-sel" onchange="onBgpDstSelect()" style="width:200px"><option value="">-- Select destination (learned route) --</option></select>
+      </div>
     </div>
 
     <div class="form-row">
@@ -728,39 +735,90 @@ function useInTraffic(prefix){
   }
   // Also populate BGP route selector with all routes
   populateBgpRoutes();
-  // Set the specific route
+  // Set the specific route in Dst dropdown
   setTimeout(()=>{
-    const sel=$('bgp-route-sel');
+    const sel=$('bgp-dst-sel');
     for(let i=0;i<sel.options.length;i++){
       if(sel.options[i].value&&sel.options[i].value.split('|')[0]===prefix){
         sel.selectedIndex=i;break;
       }
     }
-    onBgpRouteSelect();
+    onBgpDstSelect();
   },500);
 }
 
 // ═══════════════════ Traffic Tab ═══════════════════
 
-async function populateBgpRoutes(){
+// ── Src IP: namespace IPs + routes advertised BY 174 (what this box "owns") ──
+async function populateBgpSrcRoutes(){
+  try{
+    const sel=$('bgp-src-sel');
+    sel.innerHTML='<option value="">-- Select source (NS IP / advertised route) --</option>';
+
+    // 1. Fetch namespace IPs
+    const ifR=await fetch(API+'/api/iperf/interfaces');
+    const ifD=await ifR.json();
+    if(ifD.success){
+      ifD.interfaces.forEach(iface=>{
+        (iface.ipv4||[]).forEach(ip=>{
+          sel.innerHTML+=`<option value="${ip}|arp">NS ${iface.name}: ${ip}</option>`;
+        });
+        (iface.ipv6||[]).forEach(ip=>{
+          sel.innerHTML+=`<option value="${ip}|arp6">NS ${iface.name}: ${ip}</option>`;
+        });
+      });
+    }
+
+    // 2. Fetch advertised routes from BGP status
+    const bgpR=await fetch(API+'/api/bgp/status');
+    const bgpD=await bgpR.json();
+    if(bgpD.success){
+      const seen=new Set();
+      Object.values(bgpD.neighbors||{}).forEach(n=>{
+        (n.advertised_v4||[]).forEach(pfx=>{
+          const key='v4:'+pfx;
+          if(!seen.has(key)){
+            seen.add(key);
+            sel.innerHTML+=`<option value="${pfx.split('/')[0]}|arp">Adv v4: ${pfx} (to ${n.description||n.ip})</option>`;
+          }
+        });
+        (n.advertised_v6||[]).forEach(pfx=>{
+          const key='v6:'+pfx;
+          if(!seen.has(key)){
+            seen.add(key);
+            sel.innerHTML+=`<option value="${pfx.split('/')[0]}|arp6">Adv v6: ${pfx} (to ${n.description||n.ip})</option>`;
+          }
+        });
+      });
+    }
+  }catch(e){}
+}
+
+function onBgpSrcSelect(){
+  const val=$('bgp-src-sel').value;
+  if(!val)return;
+  const parts=val.split('|');
+  const ip=parts[0];
+  const macMode=parts[1]||'manual';
+  $('s-src').value=ip;
+  if(macMode.startsWith('arp'))$('s-mac-mode').value='arp';
+  onMacModeChange();
+}
+
+// ── Dst IP: routes LEARNED from BGP peers (what switches advertise = remote endpoints) ──
+async function populateBgpDstRoutes(){
   try{
     const r=await fetch(API+'/api/bgp/routes');
     const d=await r.json();
     const routes=d.routes||[];
-    const sel=$('bgp-route-sel');
-    sel.innerHTML='<option value="">-- Select a learned route --</option>'+
+    const sel=$('bgp-dst-sel');
+    sel.innerHTML='<option value="">-- Select destination (learned route) --</option>'+
       routes.map(r=>`<option value="${r.prefix}|${r.next_hop||''}">${r.prefix} (${r.af}) via ${r.peer}</option>`).join('');
   }catch(e){}
 }
 
-function onRouteSourceChange(){
-  const mode=$('route-source').value;
-  $('bgp-route-picker').style.display=(mode==='bgp')?'inline':'none';
-  if(mode==='bgp')populateBgpRoutes();
-}
-
-function onBgpRouteSelect(){
-  const val=$('bgp-route-sel').value;
+function onBgpDstSelect(){
+  const val=$('bgp-dst-sel').value;
   if(!val)return;
   const parts=val.split('|');
   const prefix=parts[0];
@@ -769,6 +827,23 @@ function onBgpRouteSelect(){
   $('s-mac-mode').value='arp';
   onMacModeChange();
   if(parts2[0].includes(':'))$('s-src').value='::1';
+}
+
+// ── Legacy compat: called from BGP tab "use in traffic" and tab switch ──
+async function populateBgpRoutes(){
+  await populateBgpSrcRoutes();
+  await populateBgpDstRoutes();
+}
+
+function onBgpRouteSelect(){
+  // Alias: selects first matching dst route in the Dst dropdown
+  // (called from useInTraffic with setTimeout)
+}
+
+function onRouteSourceChange(){
+  const mode=$('route-source').value;
+  $('bgp-route-picker').style.display=(mode==='bgp')?'block':'none';
+  if(mode==='bgp'){populateBgpSrcRoutes();populateBgpDstRoutes();}
 }
 
 function onMacModeChange(){
