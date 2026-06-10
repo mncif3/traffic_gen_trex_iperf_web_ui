@@ -750,10 +750,74 @@ function useInTraffic(prefix){
 // ═══════════════════ Traffic Tab ═══════════════════
 
 // ── Src IP: namespace IPs + routes advertised BY 174 (what this box "owns") ──
+// Value format: "ip|macmode|portnum" — portnum set for NS entries for auto-port-select
+const NS_PORT_MAP = {'iperf_ns2': '0', 'iperf_ns': '1'};
+
 async function populateBgpSrcRoutes(){
   try{
     const sel=$('bgp-src-sel');
     sel.innerHTML='<option value="">-- Select source (NS IP / advertised route) --</option>';
+
+    // 1. Fetch namespace IPs
+    const ifR=await fetch(API+'/api/iperf/interfaces');
+    const ifD=await ifR.json();
+    if(ifD.success){
+      ifD.interfaces.forEach(iface=>{
+        const portNum = NS_PORT_MAP[iface.name] || '';
+        (iface.ipv4||[]).forEach(ip=>{
+          sel.innerHTML+=`<option value="${ip}|arp|${portNum}">NS ${iface.name}: ${ip}${portNum?' [Port '+portNum+']':''}</option>`;
+        });
+        (iface.ipv6||[]).forEach(ip=>{
+          sel.innerHTML+=`<option value="${ip}|arp6|${portNum}">NS ${iface.name}: ${ip}${portNum?' [Port '+portNum+']':''}</option>`;
+        });
+      });
+    }
+
+    // 2. Fetch advertised routes from BGP status
+    const bgpR=await fetch(API+'/api/bgp/status');
+    const bgpD=await bgpR.json();
+    if(bgpD.success){
+      const seen=new Set();
+      Object.values(bgpD.neighbors||{}).forEach(n=>{
+        (n.advertised_v4||[]).forEach(pfx=>{
+          const key='v4:'+pfx;
+          if(!seen.has(key)){
+            seen.add(key);
+            sel.innerHTML+=`<option value="${pfx.split('/')[0]}|arp|">Adv v4: ${pfx} (to ${n.description||n.ip})</option>`;
+          }
+        });
+        (n.advertised_v6||[]).forEach(pfx=>{
+          const key='v6:'+pfx;
+          if(!seen.has(key)){
+            seen.add(key);
+            sel.innerHTML+=`<option value="${pfx.split('/')[0]}|arp6|">Adv v6: ${pfx} (to ${n.description||n.ip})</option>`;
+          }
+        });
+      });
+    }
+  }catch(e){}
+}
+
+function onBgpSrcSelect(){
+  const val=$('bgp-src-sel').value;
+  if(!val)return;
+  const parts=val.split('|');
+  const ip=parts[0];
+  const macMode=parts[1]||'manual';
+  const portNum=parts[2];
+  $('s-src').value=ip;
+  if(macMode.startsWith('arp'))$('s-mac-mode').value='arp';
+  onMacModeChange();
+  // Auto-select port if namespace mapped
+  if(portNum)$('s-port').value=portNum;
+}
+
+// ── Dst IP: same pool as Src — NS IPs + advertised routes (what 174 "owns") ──
+// For cross-namespace traffic testing: Src in NS1, Dst in NS2 (both on 174)
+async function populateBgpDstRoutes(){
+  try{
+    const sel=$('bgp-dst-sel');
+    sel.innerHTML='<option value="">-- Select destination (NS IP / advertised route) --</option>';
 
     // 1. Fetch namespace IPs
     const ifR=await fetch(API+'/api/iperf/interfaces');
@@ -794,39 +858,15 @@ async function populateBgpSrcRoutes(){
   }catch(e){}
 }
 
-function onBgpSrcSelect(){
-  const val=$('bgp-src-sel').value;
-  if(!val)return;
-  const parts=val.split('|');
-  const ip=parts[0];
-  const macMode=parts[1]||'manual';
-  $('s-src').value=ip;
-  if(macMode.startsWith('arp'))$('s-mac-mode').value='arp';
-  onMacModeChange();
-}
-
-// ── Dst IP: routes LEARNED from BGP peers (what switches advertise = remote endpoints) ──
-async function populateBgpDstRoutes(){
-  try{
-    const r=await fetch(API+'/api/bgp/routes');
-    const d=await r.json();
-    const routes=d.routes||[];
-    const sel=$('bgp-dst-sel');
-    sel.innerHTML='<option value="">-- Select destination (learned route) --</option>'+
-      routes.map(r=>`<option value="${r.prefix}|${r.next_hop||''}">${r.prefix} (${r.af}) via ${r.peer}</option>`).join('');
-  }catch(e){}
-}
-
 function onBgpDstSelect(){
   const val=$('bgp-dst-sel').value;
   if(!val)return;
   const parts=val.split('|');
-  const prefix=parts[0];
-  const parts2=prefix.split('/');
-  $('s-dst').value=parts2[0];
-  $('s-mac-mode').value='arp';
+  const ip=parts[0];
+  const macMode=parts[1]||'manual';
+  $('s-dst').value=ip;
+  if(macMode.startsWith('arp'))$('s-mac-mode').value='arp';
   onMacModeChange();
-  if(parts2[0].includes(':'))$('s-src').value='::1';
 }
 
 // ── Legacy compat: called from BGP tab "use in traffic" and tab switch ──
