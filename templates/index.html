@@ -1175,6 +1175,10 @@ async function startStreamPort(port){
   startStatsPoll();
 }
 
+async function delStream(n){
+  await fetch(API+'/api/streams/'+encodeURIComponent(n),{method:'DELETE'});loadStreams();
+}
+
 async function startTraffic(){
   await fetch(API+'/api/start',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({ports:[0,1],duration:-1,host:'local'})});
